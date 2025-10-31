@@ -14,6 +14,7 @@ import (
 	"io"
 	"math"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -145,6 +146,113 @@ func runImport(
 	}
 }
 
+// closerFunc is a helper type that allows a function to implement io.Closer.
+type closerFunc func() error
+
+func (f closerFunc) Close() error {
+	return f()
+}
+
+// makeFileReader creates a fileReader for the given format, applying
+// decompression for formats that need it (CSV, Avro, etc.) or providing
+// seekable access for formats that require it (Parquet).
+func makeFileReader(
+	ctx context.Context,
+	raw ioctx.ReadCloserCtx,
+	format roachpb.IOFileFormat,
+	fileSize int64,
+	dataFile string,
+) (*fileReader, io.Closer, error) {
+	// Parquet needs seekable, uncompressed access
+	// (compression is handled internally by Parquet)
+	if format.Format == roachpb.IOFileFormat_Parquet {
+		seeker, okSeek := raw.(io.Seeker)
+		readerAt, okReaderAt := raw.(io.ReaderAt)
+
+		if okSeek && okReaderAt {
+			// Cloud storage path (S3, GCS, Azure) or direct seekable file
+			// metricsReader implements ReadAt/Seek when wrapping a ResumingReader
+			log.Eventf(ctx, "Parquet import: using seekable reader (type %T)", raw)
+			readerAdapter := ioctx.ReaderCtxAdapter(ctx, raw)
+			src := &fileReader{
+				Reader:   readerAdapter,
+				ReaderAt: readerAt,
+				Seeker:   seeker,
+				total:    fileSize,
+				counter:  byteCounter{r: readerAdapter},
+			}
+			closer := closerFunc(func() error {
+				return raw.Close(ctx)
+			})
+			return src, closer, nil
+		}
+
+		// Fallback: buffer to temporary file for non-seekable readers (e.g., plain HTTP)
+		log.Eventf(ctx, "Parquet import: buffering file to disk (reader type %T does not support seeking)", raw)
+
+		// Create temporary file
+		tmpFile, err := os.CreateTemp("", "parquet-import-*.parquet")
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "failed to create temporary file for Parquet import")
+		}
+
+		// Copy data to temp file
+		reader := ioctx.ReaderCtxAdapter(ctx, raw)
+		written, err := io.Copy(tmpFile, reader)
+		if err != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+			_ = raw.Close(ctx)
+			return nil, nil, errors.Wrap(err, "failed to buffer Parquet file to disk")
+		}
+
+		// Close the original reader
+		if err := raw.Close(ctx); err != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+			return nil, nil, errors.Wrap(err, "failed to close source reader")
+		}
+
+		// Seek to beginning
+		if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+			return nil, nil, errors.Wrap(err, "failed to seek to start of temp file")
+		}
+
+		// os.File implements Reader, ReaderAt, and Seeker
+		src := &fileReader{
+			Reader:   tmpFile,
+			ReaderAt: tmpFile,
+			Seeker:   tmpFile,
+			total:    written,
+			counter:  byteCounter{r: tmpFile},
+		}
+
+		// Closer that removes temp file
+		closer := closerFunc(func() error {
+			tmpFile.Close()
+			return os.Remove(tmpFile.Name())
+		})
+
+		return src, closer, nil
+	}
+
+	// Other formats: apply decompression wrapper
+	src := &fileReader{
+		total:   fileSize,
+		counter: byteCounter{r: ioctx.ReaderCtxAdapter(ctx, raw)},
+	}
+	decompressed, err := decompressingReader(&src.counter, dataFile, format.Compression)
+	if err != nil {
+		return nil, nil, err
+	}
+	src.Reader = decompressed
+
+	// Return decompressed as closer
+	return src, decompressed, nil
+}
+
 // readInputFiles reads each of the passed dataFiles using the passed func. The
 // key part of dataFiles is the unique index of the data file among all files in
 // the IMPORT. progressFn, if not nil, is periodically invoked with a percentage
@@ -236,19 +344,19 @@ func readInputFiles(
 				return err
 			}
 			defer es.Close()
-			raw, _, err := es.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
+			// For Parquet we need the file size; for other formats it's optional but useful
+			raw, fileSize, err := es.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: false})
 			if err != nil {
 				return err
 			}
 			defer raw.Close(ctx)
 
-			src := &fileReader{total: fileSizes[dataFileIndex], counter: byteCounter{r: ioctx.ReaderCtxAdapter(ctx, raw)}}
-			decompressed, err := decompressingReader(&src.counter, dataFile, format.Compression)
+			// Create fileReader with format-specific handling
+			src, closer, err := makeFileReader(ctx, raw, format, fileSize, dataFile)
 			if err != nil {
 				return err
 			}
-			defer decompressed.Close()
-			src.Reader = decompressed
+			defer closer.Close()
 
 			var rejected chan string
 			if (format.Format == roachpb.IOFileFormat_CSV && format.SaveRejected) ||
@@ -375,6 +483,8 @@ func (b *byteCounter) Read(p []byte) (int, error) {
 
 type fileReader struct {
 	io.Reader
+	io.ReaderAt
+	io.Seeker
 	total   int64
 	counter byteCounter
 }
@@ -396,6 +506,8 @@ type inputConverter interface {
 func formatHasNamedColumns(format roachpb.IOFileFormat_FileFormat) bool {
 	switch format {
 	case roachpb.IOFileFormat_Avro:
+		return true
+	case roachpb.IOFileFormat_Parquet:
 		return true
 	}
 	return false
