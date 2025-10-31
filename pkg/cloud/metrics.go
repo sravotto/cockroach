@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/cidr"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/errors"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 )
 
@@ -174,6 +175,9 @@ type metricsReader struct {
 	ioctx.ReadCloserCtx
 	m      *Metrics
 	closed bool
+	// Cached resuming reader for implementing seeking operations
+	resumingReader *ResumingReader
+	seekPos        int64 // Current seek position
 }
 
 // Close implements the ioctx.ReadCloserCtx interface.
@@ -184,6 +188,65 @@ func (mr *metricsReader) Close(ctx context.Context) error {
 	}
 
 	return mr.ReadCloserCtx.Close(ctx)
+}
+
+// ReadAt implements io.ReaderAt for metricsReader when wrapping a ResumingReader.
+// This allows Parquet and other formats that require random access to work with
+// cloud storage backends without buffering the entire file to disk.
+func (mr *metricsReader) ReadAt(p []byte, off int64) (n int, err error) {
+	// Lazily check if underlying reader is a ResumingReader
+	if mr.resumingReader == nil {
+		mr.resumingReader, _ = mr.ReadCloserCtx.(*ResumingReader)
+	}
+
+	if mr.resumingReader == nil || mr.resumingReader.Opener == nil {
+		return 0, errors.New("ReadAt not supported: underlying reader does not support range reads")
+	}
+
+	// Use the Opener to create a reader at the specified offset
+	ctx := context.Background() // TODO: consider passing context through
+	reader, _, err := mr.resumingReader.Opener(ctx, off)
+	if err != nil {
+		return 0, err
+	}
+	defer reader.Close()
+
+	// Read the requested bytes
+	return io.ReadFull(reader, p)
+}
+
+// Seek implements io.Seeker for metricsReader when wrapping a ResumingReader.
+func (mr *metricsReader) Seek(offset int64, whence int) (int64, error) {
+	// Lazily check if underlying reader is a ResumingReader
+	if mr.resumingReader == nil {
+		mr.resumingReader, _ = mr.ReadCloserCtx.(*ResumingReader)
+	}
+
+	if mr.resumingReader == nil {
+		return 0, errors.New("Seek not supported: underlying reader is not seekable")
+	}
+
+	var newPos int64
+	switch whence {
+	case io.SeekStart:
+		newPos = offset
+	case io.SeekCurrent:
+		newPos = mr.seekPos + offset
+	case io.SeekEnd:
+		if mr.resumingReader.Size == 0 {
+			return 0, errors.New("Seek from end not supported: size unknown")
+		}
+		newPos = mr.resumingReader.Size + offset
+	default:
+		return 0, errors.Newf("invalid whence: %d", whence)
+	}
+
+	if newPos < 0 {
+		return 0, errors.New("negative position")
+	}
+
+	mr.seekPos = newPos
+	return newPos, nil
 }
 
 type metricsWriter struct {

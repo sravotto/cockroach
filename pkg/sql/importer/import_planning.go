@@ -146,6 +146,8 @@ var mysqlOutAllowedOptions = makeStringSet(
 
 var pgCopyAllowedOptions = makeStringSet(pgCopyDelimiter, pgCopyNull, optMaxRowSize)
 
+var parquetAllowedOptions = makeStringSet()
+
 // DROP is required because the target table needs to be take offline during
 // IMPORT INTO.
 var importIntoRequiredPrivileges = []privilege.Kind{privilege.INSERT, privilege.DROP}
@@ -156,6 +158,7 @@ var allowedIntoFormats = map[string]struct{}{
 	"AVRO":      {},
 	"DELIMITED": {},
 	"PGCOPY":    {},
+	"PARQUET":   {},
 }
 
 // featureImportEnabled is used to enable and disable the IMPORT feature.
@@ -608,8 +611,14 @@ func importPlanHook(
 			if err != nil {
 				return err
 			}
-		default:
-			return unimplemented.Newf("import.format", "unsupported import format: %q", importStmt.FileFormat)
+	case "PARQUET":
+		if err = validateFormatOptions(importStmt.FileFormat, opts, parquetAllowedOptions); err != nil {
+			return err
+		}
+		format.Format = roachpb.IOFileFormat_Parquet
+		// Parquet files contain their own schema, so no additional format options needed
+	default:
+		return unimplemented.Newf("import.format", "unsupported import format: %q", importStmt.FileFormat)
 		}
 
 		if override, ok := opts[importOptionDecompress]; ok {
