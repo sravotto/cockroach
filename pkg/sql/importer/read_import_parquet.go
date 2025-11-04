@@ -138,8 +138,7 @@ func (p *parquetInputReader) readFile(
 	}
 
 	// Create row producer
-	// TODO: Get actual filename from context if needed for error messages
-	producer, err := newParquetRowProducer(input, "")
+	producer, err := newParquetRowProducer(input)
 	if err != nil {
 		return err
 	}
@@ -158,7 +157,7 @@ func (p *parquetInputReader) readFile(
 const defaultParquetBatchSize = 100
 
 // newParquetRowProducer creates a new Parquet row producer from a fileReader.
-func newParquetRowProducer(input *fileReader, filename string) (*parquetRowProducer, error) {
+func newParquetRowProducer(input *fileReader) (*parquetRowProducer, error) {
 
 	reader, err := file.NewParquetReader(input)
 	if err != nil {
@@ -507,9 +506,9 @@ func newParquetRowConsumer(
 		fieldNameToIdx[strings.ToLower(string(col))] = i
 	}
 
-	// TODO: Create decoders for each column based on Parquet schema
-	// and target table column types
-	// For now, this is a placeholder
+	// Decoders are not used for import - we use manual type conversion
+	// to support Parquet files from various sources (Spark, Pandas, etc.)
+	// which may use different encoding conventions than CockroachDB's exports.
 	decoders := make([]interface{}, len(importCtx.targetCols))
 
 	return &parquetRowConsumer{
@@ -550,12 +549,10 @@ func (c *parquetRowConsumer) FillDatums(
 		if value == nil {
 			datum = tree.DNull
 		} else {
-			// Use the appropriate decoder based on the target column type
+			// Convert Parquet value to datum based on target column type
 			targetType := conv.VisibleColTypes[tableColIdx]
 			decoder := c.decoders[tableColIdx]
 
-			// TODO: Actual type conversion using pkg/util/parquet decoders
-			// For now, placeholder:
 			var err error
 			datum, err = convertParquetValueToDatum(value, targetType, decoder)
 			if err != nil {
@@ -615,9 +612,7 @@ func convertParquetValueToDatum(
 		}
 		return tree.NewDFloat(tree.DFloat(v)), nil
 	case []byte:
-		// ByteArray - could be string, timestamp, decimal, etc.
-		// For now, treat as string (most common case)
-		// TODO: Handle other types based on targetType
+		// ByteArray - handle based on target column type
 		switch targetType.Family() {
 		case types.StringFamily:
 			return tree.NewDString(string(v)), nil
@@ -635,7 +630,7 @@ func convertParquetValueToDatum(
 		case types.JsonFamily:
 			return tree.ParseDJSON(string(v))
 		default:
-			// Default to string
+			// Default to string for unknown types
 			return tree.NewDString(string(v)), nil
 		}
 	case parquet.FixedLenByteArray:
