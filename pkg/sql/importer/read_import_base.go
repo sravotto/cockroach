@@ -14,7 +14,6 @@ import (
 	"io"
 	"math"
 	"net/url"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -166,80 +165,32 @@ func makeFileReader(
 	// Parquet needs seekable, uncompressed access
 	// (compression is handled internally by Parquet)
 	if format.Format == roachpb.IOFileFormat_Parquet {
-		seeker, okSeek := raw.(io.Seeker)
-		readerAt, okReaderAt := raw.(io.ReaderAt)
-
-		if okSeek && okReaderAt {
-			// Test if seeking actually works (metricsReader implements the interface
-			// but may fail at runtime if underlying reader doesn't support it)
-			if _, err := seeker.Seek(0, io.SeekCurrent); err == nil {
-				// Cloud storage path (S3, GCS, Azure) or direct seekable file
-				log.Dev.Infof(ctx, "Parquet import: using seekable reader (type %T)", raw)
-				readerAdapter := ioctx.ReaderCtxAdapter(ctx, raw)
-				src := &fileReader{
-					Reader:   readerAdapter,
-					ReaderAt: readerAt,
-					Seeker:   seeker,
-					total:    fileSize,
-					counter:  byteCounter{r: readerAdapter},
-				}
-				closer := closerFunc(func() error {
-					return raw.Close(ctx)
-				})
-				return src, closer, nil
-			}
-			log.Dev.Infof(ctx, "Parquet import: reader claims to support seeking but test seek failed")
-		}
-
-		// Fallback: buffer to temporary file for non-seekable readers (e.g., plain HTTP)
-		log.Dev.Infof(ctx, "Parquet import: buffering file to disk (reader type %T does not support seeking)", raw)
-
-		// Create temporary file
-		tmpFile, err := os.CreateTemp("", "parquet-import-*.parquet")
+		// Use adapter to convert ReadCloserCtx to standard io interfaces for Parquet
+		// The adapter will validate that the reader supports ReadAt and Seek
+		adapted, err := ioctx.ReaderAtSeekerAdapter(ctx, raw)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "failed to create temporary file for Parquet import")
+			// Reader doesn't support random access - return helpful error message
+			return nil, nil, errors.Wrapf(err,
+				"Parquet import requires storage that supports random access. "+
+					"Use cloud storage URLs (s3://, gs://, azure://) or HTTP servers that support range requests (Accept-Ranges: bytes)")
 		}
 
-		// Copy data to temp file
-		reader := ioctx.ReaderCtxAdapter(ctx, raw)
-		written, err := io.Copy(tmpFile, reader)
-		if err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpFile.Name())
-			_ = raw.Close(ctx)
-			return nil, nil, errors.Wrap(err, "failed to buffer Parquet file to disk")
-		}
-
-		// Close the original reader
-		if err := raw.Close(ctx); err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpFile.Name())
-			return nil, nil, errors.Wrap(err, "failed to close source reader")
-		}
-
-		// Seek to beginning
-		if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpFile.Name())
-			return nil, nil, errors.Wrap(err, "failed to seek to start of temp file")
-		}
-
-		// os.File implements Reader, ReaderAt, and Seeker
 		src := &fileReader{
-			Reader:   tmpFile,
-			ReaderAt: tmpFile,
-			Seeker:   tmpFile,
-			total:    written,
-			counter:  byteCounter{r: tmpFile},
+			Reader:   adapted,
+			ReaderAt: adapted,
+			Seeker:   adapted,
+			total:    fileSize,
+			counter:  byteCounter{r: adapted},
 		}
-
-		// Closer that removes temp file
 		closer := closerFunc(func() error {
-			tmpFile.Close()
-			return os.Remove(tmpFile.Name())
+			return adapted.Close()
 		})
-
 		return src, closer, nil
+
+		// TODO: Consider re-enabling temp file buffering fallback if needed.
+		// See bufferParquetToTempFile() below for the previous implementation.
+		// This was disabled to avoid unexpected disk usage and performance issues.
+		// If re-enabled, ensure proper disk space checks and user warnings are in place.
 	}
 
 	// Other formats: apply decompression wrapper
@@ -256,6 +207,68 @@ func makeFileReader(
 	// Return decompressed as closer
 	return src, decompressed, nil
 }
+
+/*
+// bufferParquetToTempFile buffers a non-seekable reader to a temporary file on disk
+// to enable random access for Parquet reading.
+//
+// This function was previously used as a fallback when the storage backend didn't
+// support range requests (e.g., plain HTTP servers without Accept-Ranges header).
+// It has been disabled to avoid unexpected disk usage and performance issues with
+// large Parquet files.
+//
+// If re-enabling this functionality, consider:
+// - Adding disk space checks before buffering
+// - Warning users about temporary file creation
+// - Setting size limits to prevent filling up disk
+// - Providing progress indicators for large files
+func bufferParquetToTempFile(
+	ctx context.Context,
+	raw ioctx.ReadCloserCtx,
+	fileSize int64,
+) (*fileReader, io.Closer, error) {
+	tmpFile, err := os.CreateTemp("", "parquet-import-*.parquet")
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to create temporary file for Parquet import")
+	}
+
+	reader := ioctx.ReaderCtxAdapter(ctx, raw)
+	written, err := io.Copy(tmpFile, reader)
+	if err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		_ = raw.Close(ctx)
+		return nil, nil, errors.Wrap(err, "failed to buffer Parquet file to disk")
+	}
+
+	if err := raw.Close(ctx); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return nil, nil, errors.Wrap(err, "failed to close source reader")
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return nil, nil, errors.Wrap(err, "failed to seek to start of temp file")
+	}
+
+	src := &fileReader{
+		Reader:   tmpFile,
+		ReaderAt: tmpFile,
+		Seeker:   tmpFile,
+		total:    written,
+		counter:  byteCounter{r: tmpFile},
+	}
+
+	closer := closerFunc(func() error {
+		tmpFile.Close()
+		return os.Remove(tmpFile.Name())
+	})
+
+	return src, closer, nil
+}
+*/
 
 // readInputFiles reads each of the passed dataFiles using the passed func. The
 // key part of dataFiles is the unique index of the data file among all files in

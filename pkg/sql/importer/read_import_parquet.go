@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
@@ -164,11 +163,6 @@ func newParquetRowProducer(input *fileReader, filename string) (*parquetRowProdu
 
 	numColumns := reader.MetaData().Schema.NumColumns()
 
-	// Log file metadata (using Dev.Infof for debugging)
-	ctx := context.Background()
-	log.Dev.Infof(ctx, "Parquet file %s: %d row groups, %d total rows, %d columns",
-		filename, totalRowGroups, totalRows, numColumns)
-
 	return &parquetRowProducer{
 		reader:          reader,
 		currentRowGroup: -1, // Start at -1 so first advance goes to 0
@@ -192,14 +186,11 @@ func newParquetRowProducer(input *fileReader, filename string) (*parquetRowProdu
 // Scan advances to the next row. Returns false when no more rows.
 func (p *parquetRowProducer) Scan() bool {
 	if p.err != nil {
-		log.Dev.Infof(context.Background(), "Parquet Scan() returning false due to error: %v", p.err)
 		return false
 	}
 
 	// Check if we've exhausted all row groups
 	if p.currentRowGroup >= p.totalRowGroups {
-		log.Dev.Infof(context.Background(), "Parquet Scan() exhausted all row groups: %d/%d",
-			p.currentRowGroup, p.totalRowGroups)
 		return false
 	}
 
@@ -207,13 +198,11 @@ func (p *parquetRowProducer) Scan() bool {
 	if p.columnReaders == nil || p.currentRowInGroup >= p.rowsInGroup {
 		if err := p.advanceToNextRowGroup(); err != nil {
 			p.err = err
-			log.Dev.Infof(context.Background(), "Parquet Scan() error advancing row group: %v", err)
 			return false
 		}
 
 		// Check again after advancing
 		if p.currentRowGroup >= p.totalRowGroups {
-			log.Dev.Infof(context.Background(), "Parquet Scan() no more row groups after advancing")
 			return false
 		}
 	}
@@ -221,10 +210,6 @@ func (p *parquetRowProducer) Scan() bool {
 	// We have a row available in the current row group
 	p.currentRowInGroup++
 	p.rowsProcessed++
-
-	if p.rowsProcessed%1000 == 0 {
-		log.Dev.Infof(context.Background(), "Parquet Scan() processed %d rows", p.rowsProcessed)
-	}
 
 	return true
 }
@@ -234,11 +219,7 @@ func (p *parquetRowProducer) advanceToNextRowGroup() error {
 	// Move to next row group
 	p.currentRowGroup++
 
-	log.Dev.Infof(context.Background(), "Parquet advanceToNextRowGroup: moving to row group %d/%d",
-		p.currentRowGroup, p.totalRowGroups)
-
 	if p.currentRowGroup >= p.totalRowGroups {
-		log.Dev.Infof(context.Background(), "Parquet advanceToNextRowGroup: no more row groups")
 		return nil // No more row groups
 	}
 
@@ -246,8 +227,6 @@ func (p *parquetRowProducer) advanceToNextRowGroup() error {
 	rowGroup := p.reader.RowGroup(p.currentRowGroup)
 	p.rowsInGroup = rowGroup.NumRows()
 	p.currentRowInGroup = 0
-
-	log.Dev.Infof(context.Background(), "Parquet row group %d has %d rows", p.currentRowGroup, p.rowsInGroup)
 
 	// Set up column chunk readers for all columns in this row group
 	p.columnReaders = make([]file.ColumnChunkReader, p.numColumns)
@@ -258,8 +237,6 @@ func (p *parquetRowProducer) advanceToNextRowGroup() error {
 		}
 		p.columnReaders[colIdx] = colReader
 	}
-
-	log.Dev.Infof(context.Background(), "Parquet row group %d: set up %d column readers", p.currentRowGroup, len(p.columnReaders))
 
 	return nil
 }
@@ -472,18 +449,10 @@ func (c *parquetRowConsumer) FillDatums(
 	rowNum int64,
 	conv *row.DatumRowConverter,
 ) error {
-	if rowNum == 1 {
-		log.Dev.Infof(ctx, "Parquet FillDatums() called for first row, field mapping: %v", c.fieldNameToIdx)
-	}
-
 	// rowData is a []interface{} from parquetRowProducer.Row()
 	parquetRow, ok := rowData.([]interface{})
 	if !ok {
 		return errors.Errorf("expected []interface{}, got %T", rowData)
-	}
-
-	if rowNum == 1 {
-		log.Dev.Infof(ctx, "Parquet row has %d values", len(parquetRow))
 	}
 
 	// For each column in the Parquet file, find the corresponding table column
@@ -494,16 +463,8 @@ func (c *parquetRowConsumer) FillDatums(
 		// Map to table column index
 		tableColIdx, found := c.fieldNameToIdx[strings.ToLower(parquetColName)]
 		if !found {
-			if rowNum == 1 {
-				log.Dev.Infof(ctx, "Parquet column %s not found in table, skipping", parquetColName)
-			}
 			// Column in Parquet file not in table - skip or error based on strict mode
 			continue
-		}
-
-		if rowNum == 1 {
-			log.Dev.Infof(ctx, "Parquet column %s (idx %d) -> table column %d, value type: %T",
-				parquetColName, parquetColIdx, tableColIdx, value)
 		}
 
 		// Convert Parquet value to CockroachDB datum
