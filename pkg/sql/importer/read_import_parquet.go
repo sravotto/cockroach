@@ -41,7 +41,10 @@ type parquetRowProducer struct {
 	columnReaders []file.ColumnChunkReader
 	numColumns    int
 
-	// Value buffers for reading one value at a time
+	// Batching configuration
+	batchSize int64 // Number of rows to read in a single batch
+
+	// Value buffers for reading batchSize values at a time
 	// We allocate these once per row group to avoid repeated allocations
 	boolBuf    []bool
 	int32Buf   []int32
@@ -52,6 +55,11 @@ type parquetRowProducer struct {
 
 	defLevels []int16 // Definition levels (for NULL handling)
 	repLevels []int16 // Repetition levels (for arrays)
+
+	// Row buffering - stores N rows worth of values from all columns
+	bufferedValues     [][]interface{} // [column][row] - values for each column
+	bufferedRowCount   int64           // Number of rows currently buffered
+	currentBufferedRow int64           // Which buffered row to return next
 
 	// Progress tracking
 	totalRows     int64 // Total rows across all row groups
@@ -146,6 +154,9 @@ func (p *parquetInputReader) readFile(
 	return runParallelImport(ctx, p.importCtx, fileCtx, producer, consumer)
 }
 
+// Default batch size for reading Parquet rows
+const defaultParquetBatchSize = 100
+
 // newParquetRowProducer creates a new Parquet row producer from a fileReader.
 func newParquetRowProducer(input *fileReader, filename string) (*parquetRowProducer, error) {
 
@@ -162,6 +173,7 @@ func newParquetRowProducer(input *fileReader, filename string) (*parquetRowProdu
 	}
 
 	numColumns := reader.MetaData().Schema.NumColumns()
+	batchSize := int64(defaultParquetBatchSize)
 
 	return &parquetRowProducer{
 		reader:          reader,
@@ -170,16 +182,22 @@ func newParquetRowProducer(input *fileReader, filename string) (*parquetRowProdu
 		numColumns:      numColumns,
 		totalRows:       totalRows,
 		rowsProcessed:   0,
+		batchSize:       batchSize,
 
-		// Allocate buffers for reading single values
-		boolBuf:    make([]bool, 1),
-		int32Buf:   make([]int32, 1),
-		int64Buf:   make([]int64, 1),
-		float32Buf: make([]float32, 1),
-		float64Buf: make([]float64, 1),
-		bytesBuf:   make([][]byte, 1),
-		defLevels:  make([]int16, 1),
-		repLevels:  make([]int16, 1),
+		// Allocate buffers for reading batchSize values
+		boolBuf:    make([]bool, batchSize),
+		int32Buf:   make([]int32, batchSize),
+		int64Buf:   make([]int64, batchSize),
+		float32Buf: make([]float32, batchSize),
+		float64Buf: make([]float64, batchSize),
+		bytesBuf:   make([][]byte, batchSize),
+		defLevels:  make([]int16, batchSize),
+		repLevels:  make([]int16, batchSize),
+
+		// Initialize row buffering
+		bufferedValues:     make([][]interface{}, numColumns),
+		bufferedRowCount:   0,
+		currentBufferedRow: 0,
 	}, nil
 }
 
@@ -189,12 +207,18 @@ func (p *parquetRowProducer) Scan() bool {
 		return false
 	}
 
-	// Check if we've exhausted all row groups
+	// First, check if we have buffered rows available
+	// This is important because fillBuffer() may have read ahead
+	if p.currentBufferedRow < p.bufferedRowCount {
+		return true
+	}
+
+	// Buffer is empty - check if we've exhausted all row groups
 	if p.currentRowGroup >= p.totalRowGroups {
 		return false
 	}
 
-	// If we need to start a new row group
+	// If we need to start a new row group (buffer is empty and current row group exhausted)
 	if p.columnReaders == nil || p.currentRowInGroup >= p.rowsInGroup {
 		if err := p.advanceToNextRowGroup(); err != nil {
 			p.err = err
@@ -207,11 +231,13 @@ func (p *parquetRowProducer) Scan() bool {
 		}
 	}
 
-	// We have a row available in the current row group
-	p.currentRowInGroup++
-	p.rowsProcessed++
+	// We're in a valid row group with more rows to read
+	if p.currentRowInGroup < p.rowsInGroup {
+		return true
+	}
 
-	return true
+	// No buffered rows and no more rows available
+	return false
 }
 
 // advanceToNextRowGroup sets up column readers for the next row group.
@@ -241,6 +267,45 @@ func (p *parquetRowProducer) advanceToNextRowGroup() error {
 	return nil
 }
 
+// fillBuffer reads up to batchSize rows from all columns and stores them in bufferedValues.
+// This method reads N values from each column at once, improving performance.
+func (p *parquetRowProducer) fillBuffer() error {
+	// Determine how many rows to read in this batch
+	// (might be less than batchSize at end of row group)
+	rowsRemaining := p.rowsInGroup - p.currentRowInGroup
+	rowsToRead := p.batchSize
+	if rowsToRead > rowsRemaining {
+		rowsToRead = rowsRemaining
+	}
+
+	if rowsToRead <= 0 {
+		return errors.New("fillBuffer called with no rows remaining")
+	}
+
+	// Read rowsToRead values from each column
+	for colIdx := 0; colIdx < p.numColumns; colIdx++ {
+		colReader := p.columnReaders[colIdx]
+
+		// Read a batch of values from this column
+		values, err := p.readBatchFromColumn(colReader, rowsToRead)
+		if err != nil {
+			return errors.Wrapf(err, "failed to read batch from column %d", colIdx)
+		}
+
+		// Store the values for this column
+		p.bufferedValues[colIdx] = values
+	}
+
+	// Update buffer state
+	p.bufferedRowCount = rowsToRead
+	p.currentBufferedRow = 0
+
+	// Increment currentRowInGroup by the number of rows we just read
+	p.currentRowInGroup += rowsToRead
+
+	return nil
+}
+
 // Row returns the current row as a slice of interface{} values.
 // Each value is the raw Parquet value read from the column.
 func (p *parquetRowProducer) Row() (interface{}, error) {
@@ -248,153 +313,166 @@ func (p *parquetRowProducer) Row() (interface{}, error) {
 		return nil, p.err
 	}
 
-	// Allocate row to hold values from all columns
-	row := make([]interface{}, p.numColumns)
-
-	// Read one value from each column to reconstruct the row
-	for colIdx := 0; colIdx < p.numColumns; colIdx++ {
-		colReader := p.columnReaders[colIdx]
-
-		// Read one value from this column
-		// The value type depends on the Parquet physical type
-		value, isNull, err := p.readValueFromColumn(colReader)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to read value from column %d", colIdx)
-		}
-
-		if isNull {
-			row[colIdx] = nil
-		} else {
-			row[colIdx] = value
+	// Check if we need to refill the buffer
+	if p.currentBufferedRow >= p.bufferedRowCount {
+		if err := p.fillBuffer(); err != nil {
+			return nil, err
 		}
 	}
+
+	// Reconstruct the current row from buffered column values
+	row := make([]interface{}, p.numColumns)
+	for colIdx := 0; colIdx < p.numColumns; colIdx++ {
+		row[colIdx] = p.bufferedValues[colIdx][p.currentBufferedRow]
+	}
+
+	// Move to next buffered row and update progress
+	p.currentBufferedRow++
+	p.rowsProcessed++
 
 	return row, nil
 }
 
-// readValueFromColumn reads a single value from a column chunk reader.
-// Returns the value and whether it's NULL.
-func (p *parquetRowProducer) readValueFromColumn(
+// readBatchFromColumn reads a batch of values from a column chunk reader.
+// Returns a slice of interface{} values (nil for NULLs).
+func (p *parquetRowProducer) readBatchFromColumn(
 	colReader file.ColumnChunkReader,
-) (interface{}, bool, error) {
+	rowsToRead int64,
+) ([]interface{}, error) {
+	values := make([]interface{}, rowsToRead)
+
 	// Determine the physical type and use the appropriate typed reader
 	switch colReader.Type() {
 	case parquet.Types.Boolean:
 		reader := colReader.(*file.BooleanColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(1, p.boolBuf, p.defLevels, p.repLevels)
+		numRead, _, err := reader.ReadBatch(rowsToRead, p.boolBuf, p.defLevels, p.repLevels)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		if numRead == 0 {
-			return nil, false, errors.New("unexpected end of column")
+		if numRead != rowsToRead {
+			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
-		// Definition level 0 means NULL (for optional columns)
-		isNull := p.defLevels[0] == 0
-		if isNull {
-			return nil, true, nil
+		// Convert to interface{} slice, handling NULLs
+		for i := int64(0); i < rowsToRead; i++ {
+			if p.defLevels[i] == 0 {
+				values[i] = nil // NULL
+			} else {
+				values[i] = p.boolBuf[i]
+			}
 		}
-		return p.boolBuf[0], false, nil
 
 	case parquet.Types.Int32:
 		reader := colReader.(*file.Int32ColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(1, p.int32Buf, p.defLevels, p.repLevels)
+		numRead, _, err := reader.ReadBatch(rowsToRead, p.int32Buf, p.defLevels, p.repLevels)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		if numRead == 0 {
-			return nil, false, errors.New("unexpected end of column")
+		if numRead != rowsToRead {
+			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
-		isNull := p.defLevels[0] == 0
-		if isNull {
-			return nil, true, nil
+		for i := int64(0); i < rowsToRead; i++ {
+			if p.defLevels[i] == 0 {
+				values[i] = nil
+			} else {
+				values[i] = p.int32Buf[i]
+			}
 		}
-		return p.int32Buf[0], false, nil
 
 	case parquet.Types.Int64:
 		reader := colReader.(*file.Int64ColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(1, p.int64Buf, p.defLevels, p.repLevels)
+		numRead, _, err := reader.ReadBatch(rowsToRead, p.int64Buf, p.defLevels, p.repLevels)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		if numRead == 0 {
-			return nil, false, errors.New("unexpected end of column")
+		if numRead != rowsToRead {
+			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
-		isNull := p.defLevels[0] == 0
-		if isNull {
-			return nil, true, nil
+		for i := int64(0); i < rowsToRead; i++ {
+			if p.defLevels[i] == 0 {
+				values[i] = nil
+			} else {
+				values[i] = p.int64Buf[i]
+			}
 		}
-		return p.int64Buf[0], false, nil
 
 	case parquet.Types.Float:
 		reader := colReader.(*file.Float32ColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(1, p.float32Buf, p.defLevels, p.repLevels)
+		numRead, _, err := reader.ReadBatch(rowsToRead, p.float32Buf, p.defLevels, p.repLevels)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		if numRead == 0 {
-			return nil, false, errors.New("unexpected end of column")
+		if numRead != rowsToRead {
+			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
-		isNull := p.defLevels[0] == 0
-		if isNull {
-			return nil, true, nil
+		for i := int64(0); i < rowsToRead; i++ {
+			if p.defLevels[i] == 0 {
+				values[i] = nil
+			} else {
+				values[i] = p.float32Buf[i]
+			}
 		}
-		return p.float32Buf[0], false, nil
 
 	case parquet.Types.Double:
 		reader := colReader.(*file.Float64ColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(1, p.float64Buf, p.defLevels, p.repLevels)
+		numRead, _, err := reader.ReadBatch(rowsToRead, p.float64Buf, p.defLevels, p.repLevels)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		if numRead == 0 {
-			return nil, false, errors.New("unexpected end of column")
+		if numRead != rowsToRead {
+			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
-		isNull := p.defLevels[0] == 0
-		if isNull {
-			return nil, true, nil
+		for i := int64(0); i < rowsToRead; i++ {
+			if p.defLevels[i] == 0 {
+				values[i] = nil
+			} else {
+				values[i] = p.float64Buf[i]
+			}
 		}
-		return p.float64Buf[0], false, nil
 
 	case parquet.Types.ByteArray:
 		reader := colReader.(*file.ByteArrayColumnChunkReader)
-		// Create ByteArray buffer
-		byteArrayBuf := make([]parquet.ByteArray, 1)
-		numRead, _, err := reader.ReadBatch(1, byteArrayBuf, p.defLevels, p.repLevels)
+		byteArrayBuf := make([]parquet.ByteArray, rowsToRead)
+		numRead, _, err := reader.ReadBatch(rowsToRead, byteArrayBuf, p.defLevels, p.repLevels)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		if numRead == 0 {
-			return nil, false, errors.New("unexpected end of column")
+		if numRead != rowsToRead {
+			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
-		isNull := p.defLevels[0] == 0
-		if isNull {
-			return nil, true, nil
+		for i := int64(0); i < rowsToRead; i++ {
+			if p.defLevels[i] == 0 {
+				values[i] = nil
+			} else {
+				// Copy bytes since the buffer may be reused
+				copied := make([]byte, len(byteArrayBuf[i]))
+				copy(copied, byteArrayBuf[i])
+				values[i] = copied
+			}
 		}
-		// Copy the bytes since the buffer may be reused
-		result := make([]byte, len(byteArrayBuf[0]))
-		copy(result, byteArrayBuf[0])
-		return result, false, nil
 
 	case parquet.Types.FixedLenByteArray:
-		// Similar to ByteArray, but fixed length (e.g., UUIDs)
 		reader := colReader.(*file.FixedLenByteArrayColumnChunkReader)
-		fixedBuf := make([]parquet.FixedLenByteArray, 1)
-		numRead, _, err := reader.ReadBatch(1, fixedBuf, p.defLevels, p.repLevels)
+		fixedBuf := make([]parquet.FixedLenByteArray, rowsToRead)
+		numRead, _, err := reader.ReadBatch(rowsToRead, fixedBuf, p.defLevels, p.repLevels)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		if numRead == 0 {
-			return nil, false, errors.New("unexpected end of column")
+		if numRead != rowsToRead {
+			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
-		isNull := p.defLevels[0] == 0
-		if isNull {
-			return nil, true, nil
+		for i := int64(0); i < rowsToRead; i++ {
+			if p.defLevels[i] == 0 {
+				values[i] = nil
+			} else {
+				values[i] = fixedBuf[i]
+			}
 		}
-		return fixedBuf[0], false, nil
 
 	default:
-		return nil, false, errors.Errorf("unsupported Parquet type: %v", colReader.Type())
+		return nil, errors.Errorf("unsupported Parquet type: %v", colReader.Type())
 	}
+
+	return values, nil
 }
 
 // Err returns any error encountered during scanning.
