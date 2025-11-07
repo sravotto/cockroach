@@ -231,7 +231,12 @@ func (p *parquetRowProducer) Scan() bool {
 	}
 
 	// We're in a valid row group with more rows to read
+	// Fill the buffer so Row() or Skip() can consume from it
 	if p.currentRowInGroup < p.rowsInGroup {
+		if err := p.fillBuffer(); err != nil {
+			p.err = err
+			return false
+		}
 		return true
 	}
 
@@ -307,16 +312,15 @@ func (p *parquetRowProducer) fillBuffer() error {
 
 // Row returns the current row as a slice of interface{} values.
 // Each value is the raw Parquet value read from the column.
+// Scan() must be called before Row() to ensure the buffer is filled.
 func (p *parquetRowProducer) Row() (interface{}, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
 
-	// Check if we need to refill the buffer
+	// Scan() should have already filled the buffer, but check just in case
 	if p.currentBufferedRow >= p.bufferedRowCount {
-		if err := p.fillBuffer(); err != nil {
-			return nil, err
-		}
+		return nil, errors.New("Row() called without successful Scan()")
 	}
 
 	// Reconstruct the current row from buffered column values
@@ -340,6 +344,11 @@ func (p *parquetRowProducer) readBatchFromColumn(
 ) ([]interface{}, error) {
 	values := make([]interface{}, rowsToRead)
 
+	// Get the max definition level for this column to determine nullability
+	// maxDefinitionLevel = 0 means non-nullable column
+	// maxDefinitionLevel > 0 means nullable column
+	maxDefLevel := colReader.Descriptor().MaxDefinitionLevel()
+
 	// Determine the physical type and use the appropriate typed reader
 	switch colReader.Type() {
 	case parquet.Types.Boolean:
@@ -353,7 +362,9 @@ func (p *parquetRowProducer) readBatchFromColumn(
 		}
 		// Convert to interface{} slice, handling NULLs
 		for i := int64(0); i < rowsToRead; i++ {
-			if p.defLevels[i] == 0 {
+			// For nullable columns (maxDefLevel > 0), defLevel < maxDefLevel means NULL
+			// For non-nullable columns (maxDefLevel = 0), defLevel is always 0 and value is always present
+			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
 				values[i] = nil // NULL
 			} else {
 				values[i] = p.boolBuf[i]
@@ -370,7 +381,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
 		for i := int64(0); i < rowsToRead; i++ {
-			if p.defLevels[i] == 0 {
+			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
 				values[i] = nil
 			} else {
 				values[i] = p.int32Buf[i]
@@ -387,7 +398,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
 		for i := int64(0); i < rowsToRead; i++ {
-			if p.defLevels[i] == 0 {
+			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
 				values[i] = nil
 			} else {
 				values[i] = p.int64Buf[i]
@@ -404,7 +415,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
 		for i := int64(0); i < rowsToRead; i++ {
-			if p.defLevels[i] == 0 {
+			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
 				values[i] = nil
 			} else {
 				values[i] = p.float32Buf[i]
@@ -421,7 +432,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
 		for i := int64(0); i < rowsToRead; i++ {
-			if p.defLevels[i] == 0 {
+			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
 				values[i] = nil
 			} else {
 				values[i] = p.float64Buf[i]
@@ -439,7 +450,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
 		for i := int64(0); i < rowsToRead; i++ {
-			if p.defLevels[i] == 0 {
+			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
 				values[i] = nil
 			} else {
 				// Copy bytes since the buffer may be reused
@@ -460,7 +471,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
 		}
 		for i := int64(0); i < rowsToRead; i++ {
-			if p.defLevels[i] == 0 {
+			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
 				values[i] = nil
 			} else {
 				values[i] = fixedBuf[i]
@@ -481,7 +492,11 @@ func (p *parquetRowProducer) Err() error {
 
 // Skip skips the current row.
 func (p *parquetRowProducer) Skip() error {
-	// For Parquet, we've already read the row in Row(), so just continue
+	// Advance the buffered row position to skip this row
+	if p.currentBufferedRow < p.bufferedRowCount {
+		p.currentBufferedRow++
+		p.rowsProcessed++
+	}
 	return nil
 }
 
