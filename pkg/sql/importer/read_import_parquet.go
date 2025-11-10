@@ -51,7 +51,6 @@ type parquetRowProducer struct {
 	int64Buf   []int64
 	float32Buf []float32
 	float64Buf []float64
-	bytesBuf   [][]byte
 
 	defLevels []int16 // Definition levels (for NULL handling)
 	repLevels []int16 // Repetition levels (for arrays)
@@ -72,7 +71,6 @@ type parquetRowProducer struct {
 type parquetRowConsumer struct {
 	importCtx      *parallelImportContext
 	fieldNameToIdx map[string]int // Maps Parquet column name -> table column index
-	decoders       []interface{}  // Type decoders for each column (from util/parquet)
 	reader         *file.Reader   // Parquet file reader (for accessing schema)
 }
 
@@ -189,7 +187,6 @@ func newParquetRowProducer(input *fileReader) (*parquetRowProducer, error) {
 		int64Buf:   make([]int64, batchSize),
 		float32Buf: make([]float32, batchSize),
 		float64Buf: make([]float64, batchSize),
-		bytesBuf:   make([][]byte, batchSize),
 		defLevels:  make([]int16, batchSize),
 		repLevels:  make([]int16, batchSize),
 
@@ -349,6 +346,24 @@ func (p *parquetRowProducer) readBatchFromColumn(
 	// maxDefinitionLevel > 0 means nullable column
 	maxDefLevel := colReader.Descriptor().MaxDefinitionLevel()
 
+	// Helper function to process a batch after reading.
+	// Takes numRead (number of values actually read) and a function that returns the value at index i.
+	processBatch := func(numRead int64, getValue func(int64) interface{}) error {
+		if numRead != rowsToRead {
+			return errors.Newf("expected %d values, got %d", rowsToRead, numRead)
+		}
+		for i := int64(0); i < rowsToRead; i++ {
+			// For nullable columns (maxDefLevel > 0), defLevel < maxDefLevel means NULL
+			// For non-nullable columns (maxDefLevel = 0), defLevel is always 0 and value is always present
+			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
+				values[i] = nil
+			} else {
+				values[i] = getValue(i)
+			}
+		}
+		return nil
+	}
+
 	// Determine the physical type and use the appropriate typed reader
 	switch colReader.Type() {
 	case parquet.Types.Boolean:
@@ -357,19 +372,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 		if err != nil {
 			return nil, err
 		}
-		if numRead != rowsToRead {
-			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
-		}
-		// Convert to interface{} slice, handling NULLs
-		for i := int64(0); i < rowsToRead; i++ {
-			// For nullable columns (maxDefLevel > 0), defLevel < maxDefLevel means NULL
-			// For non-nullable columns (maxDefLevel = 0), defLevel is always 0 and value is always present
-			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
-				values[i] = nil // NULL
-			} else {
-				values[i] = p.boolBuf[i]
-			}
-		}
+		return values, processBatch(numRead, func(i int64) interface{} { return p.boolBuf[i] })
 
 	case parquet.Types.Int32:
 		reader := colReader.(*file.Int32ColumnChunkReader)
@@ -377,16 +380,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 		if err != nil {
 			return nil, err
 		}
-		if numRead != rowsToRead {
-			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
-		}
-		for i := int64(0); i < rowsToRead; i++ {
-			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
-				values[i] = nil
-			} else {
-				values[i] = p.int32Buf[i]
-			}
-		}
+		return values, processBatch(numRead, func(i int64) interface{} { return p.int32Buf[i] })
 
 	case parquet.Types.Int64:
 		reader := colReader.(*file.Int64ColumnChunkReader)
@@ -394,16 +388,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 		if err != nil {
 			return nil, err
 		}
-		if numRead != rowsToRead {
-			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
-		}
-		for i := int64(0); i < rowsToRead; i++ {
-			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
-				values[i] = nil
-			} else {
-				values[i] = p.int64Buf[i]
-			}
-		}
+		return values, processBatch(numRead, func(i int64) interface{} { return p.int64Buf[i] })
 
 	case parquet.Types.Float:
 		reader := colReader.(*file.Float32ColumnChunkReader)
@@ -411,16 +396,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 		if err != nil {
 			return nil, err
 		}
-		if numRead != rowsToRead {
-			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
-		}
-		for i := int64(0); i < rowsToRead; i++ {
-			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
-				values[i] = nil
-			} else {
-				values[i] = p.float32Buf[i]
-			}
-		}
+		return values, processBatch(numRead, func(i int64) interface{} { return p.float32Buf[i] })
 
 	case parquet.Types.Double:
 		reader := colReader.(*file.Float64ColumnChunkReader)
@@ -428,16 +404,7 @@ func (p *parquetRowProducer) readBatchFromColumn(
 		if err != nil {
 			return nil, err
 		}
-		if numRead != rowsToRead {
-			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
-		}
-		for i := int64(0); i < rowsToRead; i++ {
-			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
-				values[i] = nil
-			} else {
-				values[i] = p.float64Buf[i]
-			}
-		}
+		return values, processBatch(numRead, func(i int64) interface{} { return p.float64Buf[i] })
 
 	case parquet.Types.ByteArray:
 		reader := colReader.(*file.ByteArrayColumnChunkReader)
@@ -446,19 +413,12 @@ func (p *parquetRowProducer) readBatchFromColumn(
 		if err != nil {
 			return nil, err
 		}
-		if numRead != rowsToRead {
-			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
-		}
-		for i := int64(0); i < rowsToRead; i++ {
-			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
-				values[i] = nil
-			} else {
-				// Copy bytes since the buffer may be reused
-				copied := make([]byte, len(byteArrayBuf[i]))
-				copy(copied, byteArrayBuf[i])
-				values[i] = copied
-			}
-		}
+		return values, processBatch(numRead, func(i int64) interface{} {
+			// Copy bytes since the buffer may be reused
+			copied := make([]byte, len(byteArrayBuf[i]))
+			copy(copied, byteArrayBuf[i])
+			return copied
+		})
 
 	case parquet.Types.FixedLenByteArray:
 		reader := colReader.(*file.FixedLenByteArrayColumnChunkReader)
@@ -467,22 +427,11 @@ func (p *parquetRowProducer) readBatchFromColumn(
 		if err != nil {
 			return nil, err
 		}
-		if numRead != rowsToRead {
-			return nil, errors.Newf("expected %d values, got %d", rowsToRead, numRead)
-		}
-		for i := int64(0); i < rowsToRead; i++ {
-			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
-				values[i] = nil
-			} else {
-				values[i] = fixedBuf[i]
-			}
-		}
+		return values, processBatch(numRead, func(i int64) interface{} { return fixedBuf[i] })
 
 	default:
 		return nil, errors.Errorf("unsupported Parquet type: %v", colReader.Type())
 	}
-
-	return values, nil
 }
 
 // Err returns any error encountered during scanning.
@@ -521,15 +470,9 @@ func newParquetRowConsumer(
 		fieldNameToIdx[strings.ToLower(string(col))] = i
 	}
 
-	// Decoders are not used for import - we use manual type conversion
-	// to support Parquet files from various sources (Spark, Pandas, etc.)
-	// which may use different encoding conventions than CockroachDB's exports.
-	decoders := make([]interface{}, len(importCtx.targetCols))
-
 	return &parquetRowConsumer{
 		importCtx:      importCtx,
 		fieldNameToIdx: fieldNameToIdx,
-		decoders:       decoders,
 		reader:         producer.reader,
 	}, nil
 }
@@ -566,10 +509,9 @@ func (c *parquetRowConsumer) FillDatums(
 		} else {
 			// Convert Parquet value to datum based on target column type
 			targetType := conv.VisibleColTypes[tableColIdx]
-			decoder := c.decoders[tableColIdx]
 
 			var err error
-			datum, err = convertParquetValueToDatum(value, targetType, decoder)
+			datum, err = convertParquetValueToDatum(value, targetType)
 			if err != nil {
 				return newImportRowError(err, fmt.Sprintf("row %d", rowNum), rowNum)
 			}
@@ -594,9 +536,7 @@ func (c *parquetRowConsumer) FillDatums(
 // This performs basic type conversions - more complex types (arrays, nested)
 // would need additional handling.
 func convertParquetValueToDatum(
-	value interface{},
-	targetType *types.T,
-	decoder interface{},
+	value interface{}, targetType *types.T,
 ) (tree.Datum, error) {
 	// Type switch on the value type and convert to appropriate datum
 	switch v := value.(type) {

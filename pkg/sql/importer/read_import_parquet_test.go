@@ -128,7 +128,7 @@ func TestConvertParquetValueToDatum(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := convertParquetValueToDatum(tc.value, tc.targetType, nil)
+			result, err := convertParquetValueToDatum(tc.value, tc.targetType)
 			if tc.expectErr {
 				require.Error(t, err)
 				return
