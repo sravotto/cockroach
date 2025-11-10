@@ -13,6 +13,7 @@ import (
 	"github.com/apache/arrow/go/v11/arrow/array"
 	"github.com/apache/arrow/go/v11/arrow/memory"
 	"github.com/apache/arrow/go/v11/parquet"
+	"github.com/apache/arrow/go/v11/parquet/compress"
 	"github.com/apache/arrow/go/v11/parquet/pqarrow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -146,7 +147,7 @@ func TestConvertParquetValueToDatum(t *testing.T) {
 }
 
 // createTestParquetFile creates a simple Parquet file in memory for testing
-func createTestParquetFile(t *testing.T, numRows int) *bytes.Buffer {
+func createTestParquetFile(t *testing.T, numRows int, compression compress.Compression) *bytes.Buffer {
 	// Handle empty file case - return nil, tests should check for this
 	if numRows == 0 {
 		return nil
@@ -192,9 +193,10 @@ func createTestParquetFile(t *testing.T, numRows int) *bytes.Buffer {
 	record := builder.NewRecord()
 	defer record.Release()
 
-	// Write to Parquet format
+	// Write to Parquet format with specified compression
 	buf := new(bytes.Buffer)
-	writer, err := pqarrow.NewFileWriter(schema, buf, parquet.NewWriterProperties(), pqarrow.DefaultWriterProps())
+	writerProps := parquet.NewWriterProperties(parquet.WithCompression(compression))
+	writer, err := pqarrow.NewFileWriter(schema, buf, writerProps, pqarrow.DefaultWriterProps())
 	require.NoError(t, err)
 
 	err = writer.Write(record)
@@ -210,45 +212,61 @@ func TestParquetRowProducerBasicScanning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Create a test Parquet file with 10 rows
-	parquetData := createTestParquetFile(t, 10)
-
-	// Create fileReader from buffer - use the same bytes.Reader instance for all interfaces
-	reader := bytes.NewReader(parquetData.Bytes())
-	fileReader := &fileReader{
-		Reader:   reader,
-		ReaderAt: reader,
-		Seeker:   reader,
-		total:    int64(parquetData.Len()),
+	// Test all supported compression codecs
+	testCases := []struct {
+		name        string
+		compression compress.Compression
+	}{
+		{"Uncompressed", compress.Codecs.Uncompressed},
+		{"Gzip", compress.Codecs.Gzip},
+		{"Snappy", compress.Codecs.Snappy},
+		{"Zstd", compress.Codecs.Zstd},
+		{"Brotli", compress.Codecs.Brotli},
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
-	require.NoError(t, err)
-	require.NotNil(t, producer)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a test Parquet file with 10 rows and specified compression
+			parquetData := createTestParquetFile(t, 10, tc.compression)
 
-	// Verify initial state
-	require.Equal(t, int64(10), producer.totalRows)
-	require.Equal(t, 4, producer.numColumns) // id, name, score, active
+			// Create fileReader from buffer - use the same bytes.Reader instance for all interfaces
+			reader := bytes.NewReader(parquetData.Bytes())
+			fileReader := &fileReader{
+				Reader:   reader,
+				ReaderAt: reader,
+				Seeker:   reader,
+				total:    int64(parquetData.Len()),
+			}
 
-	// Scan all rows
-	rowCount := 0
-	for producer.Scan() {
-		row, err := producer.Row()
-		require.NoError(t, err)
-		require.NotNil(t, row)
+			producer, err := newParquetRowProducer(fileReader)
+			require.NoError(t, err)
+			require.NotNil(t, producer)
 
-		rowData := row.([]interface{})
-		require.Equal(t, 4, len(rowData))
+			// Verify initial state
+			require.Equal(t, int64(10), producer.totalRows)
+			require.Equal(t, 4, producer.numColumns) // id, name, score, active
 
-		// Verify ID column (always present)
-		require.Equal(t, int32(rowCount), rowData[0])
+			// Scan all rows
+			rowCount := 0
+			for producer.Scan() {
+				row, err := producer.Row()
+				require.NoError(t, err)
+				require.NotNil(t, row)
 
-		rowCount++
+				rowData := row.([]interface{})
+				require.Equal(t, 4, len(rowData))
+
+				// Verify ID column (always present)
+				require.Equal(t, int32(rowCount), rowData[0])
+
+				rowCount++
+			}
+
+			require.NoError(t, producer.Err())
+			require.Equal(t, 10, rowCount)
+			require.Equal(t, float32(1.0), producer.Progress())
+		})
 	}
-
-	require.NoError(t, producer.Err())
-	require.Equal(t, 10, rowCount)
-	require.Equal(t, float32(1.0), producer.Progress())
 }
 
 func TestParquetRowProducerNullHandling(t *testing.T) {
@@ -256,7 +274,7 @@ func TestParquetRowProducerNullHandling(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Create a test Parquet file
-	parquetData := createTestParquetFile(t, 15)
+	parquetData := createTestParquetFile(t, 15, compress.Codecs.Uncompressed)
 
 	reader := bytes.NewReader(parquetData.Bytes())
 	fileReader := &fileReader{
@@ -304,7 +322,7 @@ func TestParquetRowProducerBatching(t *testing.T) {
 
 	// Create a file with more rows than the batch size
 	numRows := 250
-	parquetData := createTestParquetFile(t, numRows)
+	parquetData := createTestParquetFile(t, numRows, compress.Codecs.Uncompressed)
 
 	reader := bytes.NewReader(parquetData.Bytes())
 	fileReader := &fileReader{
@@ -342,7 +360,7 @@ func TestParquetRowProducerProgress(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	numRows := 100
-	parquetData := createTestParquetFile(t, numRows)
+	parquetData := createTestParquetFile(t, numRows, compress.Codecs.Uncompressed)
 
 	reader := bytes.NewReader(parquetData.Bytes())
 	fileReader := &fileReader{
@@ -384,7 +402,7 @@ func TestParquetRowProducerSingleRow(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Create a Parquet file with just 1 row
-	parquetData := createTestParquetFile(t, 1)
+	parquetData := createTestParquetFile(t, 1, compress.Codecs.Uncompressed)
 
 	reader := bytes.NewReader(parquetData.Bytes())
 	fileReader := &fileReader{
@@ -412,7 +430,7 @@ func TestParquetRowProducerSkip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	parquetData := createTestParquetFile(t, 10)
+	parquetData := createTestParquetFile(t, 10, compress.Codecs.Uncompressed)
 
 	reader := bytes.NewReader(parquetData.Bytes())
 	fileReader := &fileReader{
@@ -449,7 +467,7 @@ func TestParquetRowConsumerCreation(t *testing.T) {
 	}
 
 	// Create a mock Parquet file to get the schema
-	parquetData := createTestParquetFile(t, 1)
+	parquetData := createTestParquetFile(t, 1, compress.Codecs.Uncompressed)
 	reader := bytes.NewReader(parquetData.Bytes())
 	fileReader := &fileReader{
 		Reader:   reader,
