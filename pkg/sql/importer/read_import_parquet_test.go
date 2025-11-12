@@ -7,6 +7,8 @@ package importer
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/apache/arrow/go/v11/arrow"
@@ -17,6 +19,7 @@ import (
 	"github.com/apache/arrow/go/v11/parquet/pqarrow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -488,4 +491,273 @@ func TestParquetRowConsumerCreation(t *testing.T) {
 	require.Contains(t, consumer.fieldNameToIdx, "name")
 	require.Contains(t, consumer.fieldNameToIdx, "score")
 	require.Contains(t, consumer.fieldNameToIdx, "active")
+}
+
+// TestParquetMultipleFloat64Columns tests that multiple float64 columns
+// don't interfere with each other due to buffer reuse.
+func TestParquetMultipleFloat64Columns(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	pool := memory.NewGoAllocator()
+
+	// Mimic the Titanic dataset structure with Age and Fare as float64
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "PassengerId", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+			{Name: "Age", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+			{Name: "Fare", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+		},
+		nil,
+	)
+
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	idBuilder := builder.Field(0).(*array.Int64Builder)
+	ageBuilder := builder.Field(1).(*array.Float64Builder)
+	fareBuilder := builder.Field(2).(*array.Float64Builder)
+
+	// PassengerId, Age, Fare
+	idBuilder.Append(1)
+	ageBuilder.Append(32.0)
+	fareBuilder.Append(7.75)
+
+	idBuilder.Append(2)
+	ageBuilder.Append(26.0)
+	fareBuilder.Append(79.20)
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// Write to Parquet format
+	buf := new(bytes.Buffer)
+	writerProps := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Uncompressed))
+	writer, err := pqarrow.NewFileWriter(schema, buf, writerProps, pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+
+	err = writer.Write(record)
+	require.NoError(t, err)
+
+	err = writer.Close()
+	require.NoError(t, err)
+
+	// Read back using our importer
+	reader := bytes.NewReader(buf.Bytes())
+	fileReader := &fileReader{
+		Reader:   reader,
+		ReaderAt: reader,
+		Seeker:   reader,
+		total:    int64(buf.Len()),
+	}
+
+	producer, err := newParquetRowProducer(fileReader)
+	require.NoError(t, err)
+	require.NotNil(t, producer)
+
+	// Verify we can read the data correctly
+	require.Equal(t, int64(2), producer.totalRows)
+	require.Equal(t, 3, producer.numColumns)
+
+	// Scan and verify each row
+	rowNum := 0
+	for producer.Scan() {
+		row, err := producer.Row()
+		require.NoError(t, err)
+
+		rowData := row.([]interface{})
+		require.Equal(t, 3, len(rowData))
+
+		if rowNum == 0 {
+			// Row 1: PassengerId=1, Age=32.0, Fare=7.75
+			require.Equal(t, int64(1), rowData[0])
+			require.Equal(t, float64(32.0), rowData[1], "Age should be 32.0, not %v", rowData[1])
+			require.Equal(t, float64(7.75), rowData[2], "Fare should be 7.75, not %v", rowData[2])
+		} else if rowNum == 1 {
+			// Row 2: PassengerId=2, Age=26.0, Fare=79.20
+			require.Equal(t, int64(2), rowData[0])
+			require.Equal(t, float64(26.0), rowData[1], "Age should be 26.0, not %v", rowData[1])
+			require.Equal(t, float64(79.20), rowData[2], "Fare should be 79.20, not %v", rowData[2])
+		}
+
+		rowNum++
+	}
+
+	require.NoError(t, producer.Err())
+	require.Equal(t, 2, rowNum)
+}
+
+// TestParquetMultipleFloat64ColumnsLargeFile tests buffer reuse across batches
+func TestParquetMultipleFloat64ColumnsLargeFile(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	pool := memory.NewGoAllocator()
+
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "PassengerId", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+			{Name: "Age", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+			{Name: "Fare", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+		},
+		nil,
+	)
+
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	idBuilder := builder.Field(0).(*array.Int64Builder)
+	ageBuilder := builder.Field(1).(*array.Float64Builder)
+	fareBuilder := builder.Field(2).(*array.Float64Builder)
+
+	// Create 250 rows to force multiple batches (batch size is 100)
+	for i := int64(0); i < 250; i++ {
+		idBuilder.Append(i + 1)
+		ageBuilder.Append(float64(20 + i))        // Age: 20, 21, 22, ..., 269
+		fareBuilder.Append(10.0 + float64(i)*0.5) // Fare: 10.0, 10.5, 11.0, ..., 134.5
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	buf := new(bytes.Buffer)
+	writerProps := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Uncompressed))
+	writer, err := pqarrow.NewFileWriter(schema, buf, writerProps, pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+
+	err = writer.Write(record)
+	require.NoError(t, err)
+
+	err = writer.Close()
+	require.NoError(t, err)
+
+	// Read back using our importer
+	reader := bytes.NewReader(buf.Bytes())
+	fileReader := &fileReader{
+		Reader:   reader,
+		ReaderAt: reader,
+		Seeker:   reader,
+		total:    int64(buf.Len()),
+	}
+
+	producer, err := newParquetRowProducer(fileReader)
+	require.NoError(t, err)
+
+	// Verify all rows
+	rowNum := int64(0)
+	for producer.Scan() {
+		row, err := producer.Row()
+		require.NoError(t, err)
+
+		rowData := row.([]interface{})
+		expectedAge := float64(20 + rowNum)
+		expectedFare := 10.0 + float64(rowNum)*0.5
+
+		require.Equal(t, rowNum+1, rowData[0], "Row %d: wrong PassengerId", rowNum)
+		require.Equal(t, expectedAge, rowData[1], "Row %d: Age should be %.1f, got %v", rowNum, expectedAge, rowData[1])
+		require.Equal(t, expectedFare, rowData[2], "Row %d: Fare should be %.2f, got %v", rowNum, expectedFare, rowData[2])
+
+		rowNum++
+	}
+
+	require.NoError(t, producer.Err())
+	require.Equal(t, int64(250), rowNum)
+}
+
+// TestParquetReadTitanicFile reads the Titanic Parquet file from testdata
+func TestParquetReadTitanicFile(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Open the Titanic data file from testdata
+	dir := datapathutils.TestDataPath(t, "parquet")
+	f, err := os.Open(filepath.Join(dir, "titanic.parquet"))
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Get file size for the fileReader
+	stat, err := f.Stat()
+	require.NoError(t, err)
+
+	// Create fileReader
+	fileReader := &fileReader{
+		Reader:   f,
+		ReaderAt: f,
+		Seeker:   f,
+		total:    stat.Size(),
+	}
+
+	producer, err := newParquetRowProducer(fileReader)
+	require.NoError(t, err)
+	require.NotNil(t, producer)
+
+	t.Logf("Total rows: %d", producer.totalRows)
+	t.Logf("Num columns: %d", producer.numColumns)
+	t.Logf("Total row groups: %d", producer.totalRowGroups)
+
+	// Check rows per row group
+	for i := 0; i < producer.totalRowGroups; i++ {
+		rg := producer.reader.RowGroup(i)
+		t.Logf("Row group %d: %d rows", i, rg.NumRows())
+	}
+
+	// Print schema
+	for i := 0; i < producer.numColumns; i++ {
+		col := producer.reader.MetaData().Schema.Column(i)
+		t.Logf("Column %d: %s (type: %s)", i, col.Name(), col.PhysicalType())
+	}
+
+	// Read all rows and collect the last 5
+	lastRows := make([][]interface{}, 0, 5)
+	rowCount := int64(0)
+
+	for producer.Scan() {
+		row, err := producer.Row()
+		require.NoError(t, err)
+
+		rowData := row.([]interface{})
+
+		// Keep only last 5 rows
+		if len(lastRows) >= 5 {
+			lastRows = lastRows[1:]
+		}
+		lastRows = append(lastRows, rowData)
+		rowCount++
+	}
+
+	require.NoError(t, producer.Err())
+	t.Logf("Total rows read: %d", rowCount)
+
+	// Print the last 5 rows with detailed Age/Fare info
+	t.Logf("\nLast %d rows:", len(lastRows))
+	for i, rowData := range lastRows {
+		rowNum := rowCount - int64(len(lastRows)) + int64(i)
+
+		// Specifically check columns 5 (Age) and 9 (Fare) if they exist
+		if producer.numColumns > 9 {
+			passengerId := rowData[0]
+			age := rowData[5]
+			fare := rowData[9]
+			t.Logf("Row %d: PassengerId=%v, Age=%v, Fare=%v", rowNum, passengerId, age, fare)
+		} else {
+			t.Logf("Row %d: %v", rowNum, rowData)
+		}
+	}
+
+	// Expected values based on CSV:
+	// Row 890 (PassengerId 891): Age should be 32.0, Fare should be 7.75
+	t.Logf("\nExpected for Row 890: Age=32.0, Fare=7.75")
+	if len(lastRows) > 0 {
+		lastRow := lastRows[len(lastRows)-1]
+		age := lastRow[5]
+		fare := lastRow[9]
+		if age != nil {
+			ageVal := age.(float64)
+			fareVal := fare.(float64)
+			t.Logf("Actual:   Age=%.2f, Fare=%.2f", ageVal, fareVal)
+			if ageVal == 7.75 {
+				t.Errorf("BUG DETECTED: Age shows Fare value (7.75 instead of 32.0)")
+			}
+		}
+	}
 }

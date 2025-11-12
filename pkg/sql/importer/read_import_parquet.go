@@ -347,18 +347,22 @@ func (p *parquetRowProducer) readBatchFromColumn(
 	maxDefLevel := colReader.Descriptor().MaxDefinitionLevel()
 
 	// Helper function to process a batch after reading.
-	// Takes numRead (number of values actually read) and a function that returns the value at index i.
-	processBatch := func(numRead int64, getValue func(int64) interface{}) error {
+	// For nullable columns, valuesRead < numRead because NULLs don't have values in the buffer.
+	// We use a separate index (valIdx) to track position in the values buffer.
+	processBatch := func(numRead int64, valuesRead int, getValue func(int) interface{}) error {
 		if numRead != rowsToRead {
-			return errors.Newf("expected %d values, got %d", rowsToRead, numRead)
+			return errors.Newf("expected %d rows, got %d", rowsToRead, numRead)
 		}
-		for i := int64(0); i < rowsToRead; i++ {
-			// For nullable columns (maxDefLevel > 0), defLevel < maxDefLevel means NULL
-			// For non-nullable columns (maxDefLevel = 0), defLevel is always 0 and value is always present
+		valIdx := 0
+		for i := int64(0); i < numRead; i++ {
 			if maxDefLevel > 0 && p.defLevels[i] < maxDefLevel {
 				values[i] = nil
 			} else {
-				values[i] = getValue(i)
+				if valIdx >= valuesRead {
+					return errors.Newf("values index %d exceeds valuesRead %d", valIdx, valuesRead)
+				}
+				values[i] = getValue(valIdx)
+				valIdx++
 			}
 		}
 		return nil
@@ -368,52 +372,52 @@ func (p *parquetRowProducer) readBatchFromColumn(
 	switch colReader.Type() {
 	case parquet.Types.Boolean:
 		reader := colReader.(*file.BooleanColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(rowsToRead, p.boolBuf, p.defLevels, p.repLevels)
+		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.boolBuf, p.defLevels, p.repLevels)
 		if err != nil {
 			return nil, err
 		}
-		return values, processBatch(numRead, func(i int64) interface{} { return p.boolBuf[i] })
+		return values, processBatch(numRead, valuesRead, func(i int) interface{} { return p.boolBuf[i] })
 
 	case parquet.Types.Int32:
 		reader := colReader.(*file.Int32ColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(rowsToRead, p.int32Buf, p.defLevels, p.repLevels)
+		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.int32Buf, p.defLevels, p.repLevels)
 		if err != nil {
 			return nil, err
 		}
-		return values, processBatch(numRead, func(i int64) interface{} { return p.int32Buf[i] })
+		return values, processBatch(numRead, valuesRead, func(i int) interface{} { return p.int32Buf[i] })
 
 	case parquet.Types.Int64:
 		reader := colReader.(*file.Int64ColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(rowsToRead, p.int64Buf, p.defLevels, p.repLevels)
+		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.int64Buf, p.defLevels, p.repLevels)
 		if err != nil {
 			return nil, err
 		}
-		return values, processBatch(numRead, func(i int64) interface{} { return p.int64Buf[i] })
+		return values, processBatch(numRead, valuesRead, func(i int) interface{} { return p.int64Buf[i] })
 
 	case parquet.Types.Float:
 		reader := colReader.(*file.Float32ColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(rowsToRead, p.float32Buf, p.defLevels, p.repLevels)
+		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.float32Buf, p.defLevels, p.repLevels)
 		if err != nil {
 			return nil, err
 		}
-		return values, processBatch(numRead, func(i int64) interface{} { return p.float32Buf[i] })
+		return values, processBatch(numRead, valuesRead, func(i int) interface{} { return p.float32Buf[i] })
 
 	case parquet.Types.Double:
 		reader := colReader.(*file.Float64ColumnChunkReader)
-		numRead, _, err := reader.ReadBatch(rowsToRead, p.float64Buf, p.defLevels, p.repLevels)
+		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.float64Buf, p.defLevels, p.repLevels)
 		if err != nil {
 			return nil, err
 		}
-		return values, processBatch(numRead, func(i int64) interface{} { return p.float64Buf[i] })
+		return values, processBatch(numRead, valuesRead, func(i int) interface{} { return p.float64Buf[i] })
 
 	case parquet.Types.ByteArray:
 		reader := colReader.(*file.ByteArrayColumnChunkReader)
 		byteArrayBuf := make([]parquet.ByteArray, rowsToRead)
-		numRead, _, err := reader.ReadBatch(rowsToRead, byteArrayBuf, p.defLevels, p.repLevels)
+		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, byteArrayBuf, p.defLevels, p.repLevels)
 		if err != nil {
 			return nil, err
 		}
-		return values, processBatch(numRead, func(i int64) interface{} {
+		return values, processBatch(numRead, valuesRead, func(i int) interface{} {
 			// Copy bytes since the buffer may be reused
 			copied := make([]byte, len(byteArrayBuf[i]))
 			copy(copied, byteArrayBuf[i])
@@ -423,11 +427,11 @@ func (p *parquetRowProducer) readBatchFromColumn(
 	case parquet.Types.FixedLenByteArray:
 		reader := colReader.(*file.FixedLenByteArrayColumnChunkReader)
 		fixedBuf := make([]parquet.FixedLenByteArray, rowsToRead)
-		numRead, _, err := reader.ReadBatch(rowsToRead, fixedBuf, p.defLevels, p.repLevels)
+		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, fixedBuf, p.defLevels, p.repLevels)
 		if err != nil {
 			return nil, err
 		}
-		return values, processBatch(numRead, func(i int64) interface{} { return fixedBuf[i] })
+		return values, processBatch(numRead, valuesRead, func(i int) interface{} { return fixedBuf[i] })
 
 	default:
 		return nil, errors.Errorf("unsupported Parquet type: %v", colReader.Type())
@@ -557,13 +561,16 @@ func convertParquetValueToDatum(
 	case float32:
 		// Check if target is decimal
 		if targetType.Family() == types.DecimalFamily {
-			return tree.ParseDDecimal(fmt.Sprintf("%f", v))
+			// Use %g format to avoid unnecessary trailing zeros and handle scientific notation
+			return tree.ParseDDecimal(fmt.Sprintf("%g", v))
 		}
 		return tree.NewDFloat(tree.DFloat(v)), nil
 	case float64:
 		// Check if target is decimal
 		if targetType.Family() == types.DecimalFamily {
-			return tree.ParseDDecimal(fmt.Sprintf("%f", v))
+			// Use %g format to avoid unnecessary trailing zeros and handle scientific notation
+			// This preserves the full precision of the float64
+			return tree.ParseDDecimal(fmt.Sprintf("%g", v))
 		}
 		return tree.NewDFloat(tree.DFloat(v)), nil
 	case []byte:
@@ -574,6 +581,10 @@ func convertParquetValueToDatum(
 		case types.BytesFamily:
 			return tree.NewDBytes(tree.DBytes(v)), nil
 		case types.TimestampFamily:
+			// Empty byte arrays cannot be parsed as timestamps - treat as NULL
+			if len(v) == 0 {
+				return tree.DNull, nil
+			}
 			// Parse as timestamp
 			ts, _, err := tree.ParseDTimestamp(nil, string(v), time.Microsecond)
 			if err != nil {
@@ -581,8 +592,16 @@ func convertParquetValueToDatum(
 			}
 			return ts, nil
 		case types.DecimalFamily:
+			// Empty byte arrays cannot be parsed as decimals - treat as NULL
+			if len(v) == 0 {
+				return tree.DNull, nil
+			}
 			return tree.ParseDDecimal(string(v))
 		case types.JsonFamily:
+			// Empty byte arrays cannot be parsed as JSON - treat as NULL
+			if len(v) == 0 {
+				return tree.DNull, nil
+			}
 			return tree.ParseDJSON(string(v))
 		default:
 			// Default to string for unknown types
