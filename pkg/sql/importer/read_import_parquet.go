@@ -467,13 +467,12 @@ func (p *parquetRowProducer) Progress() float32 {
 	return float32(p.rowsProcessed) / float32(p.totalRows)
 }
 
-// newParquetRowConsumer creates a consumer that converts Parquet rows to datums.
-func newParquetRowConsumer(
+// validateAndBuildColumnMapping validates the Parquet schema against the table schema
+// and builds a mapping from Parquet column names to table column indices.
+func validateAndBuildColumnMapping(
 	importCtx *parallelImportContext,
 	producer *parquetRowProducer,
-	fileCtx *importFileContext,
-	strict bool,
-) (*parquetRowConsumer, error) {
+) (map[string]int, error) {
 	parquetSchema := producer.reader.MetaData().Schema
 
 	// Build a map of Parquet column names (lowercase) for quick lookup
@@ -482,78 +481,92 @@ func newParquetRowConsumer(
 		parquetCol := parquetSchema.Column(parquetColIdx)
 		parquetColNames[strings.ToLower(parquetCol.Name())] = true
 	}
-
-	// Build mapping from Parquet column names to table column indices
 	fieldNameToIdx := make(map[string]int)
 
-	// Determine which table columns to use
-	var targetCols []string
-	var visibleCols []catalog.Column
-
-	if importCtx.tableDesc != nil {
-		visibleCols = importCtx.tableDesc.VisibleColumns()
-
-		// If targetCols is empty, use all visible columns (automatic mapping)
-		if len(importCtx.targetCols) == 0 {
-			for _, col := range visibleCols {
-				targetCols = append(targetCols, col.GetName())
-			}
-		} else {
-			// Use explicitly specified columns
-			for _, col := range importCtx.targetCols {
-				targetCols = append(targetCols, string(col))
-			}
-		}
-
-		// Build the mapping: parquet column name (lowercase) -> table column index
-		for i, colName := range targetCols {
-			fieldNameToIdx[strings.ToLower(colName)] = i
-		}
-
-		// Validate type compatibility for columns that exist in both Parquet and table
-		for parquetColIdx := 0; parquetColIdx < parquetSchema.NumColumns(); parquetColIdx++ {
-			parquetCol := parquetSchema.Column(parquetColIdx)
-			parquetColName := parquetCol.Name()
-
-			// Find corresponding table column
-			tableColIdx, found := fieldNameToIdx[strings.ToLower(parquetColName)]
-			if !found {
-				// Column exists in Parquet but not in target table - that's okay, we'll skip it
-				continue
-			}
-
-			// Get target column type from the table descriptor
-			targetCol := visibleCols[tableColIdx]
-			targetType := targetCol.GetType()
-
-			// Validate type compatibility
-			if err := validateParquetTypeCompatibility(parquetCol, targetType); err != nil {
-				return nil, errors.Wrapf(err, "column %q", parquetColName)
-			}
-		}
-
-		// Validate that all required table columns are present in the Parquet file
-		// Required = non-nullable columns without defaults
-		for i, colName := range targetCols {
-			targetCol := visibleCols[i]
-
-			// Check if this column exists in the Parquet file (case-insensitive)
-			if !parquetColNames[strings.ToLower(colName)] {
-				// Column missing from Parquet file - check if it's required
-				if !targetCol.IsNullable() && !targetCol.HasDefault() && !targetCol.IsComputed() {
-					return nil, errors.Newf(
-						"required table column %q (non-nullable, no default) not found in Parquet file",
-						colName,
-					)
-				}
-				// Optional column (nullable or has default) - will be set to NULL or default value
-			}
-		}
-	} else {
+	if importCtx.tableDesc == nil {
 		// No table descriptor (test mode) - use targetCols as-is
 		for i, col := range importCtx.targetCols {
 			fieldNameToIdx[strings.ToLower(string(col))] = i
 		}
+		return fieldNameToIdx, nil
+	}
+
+	visibleCols := importCtx.tableDesc.VisibleColumns()
+
+	// Determine which table columns to use
+	var targetCols []string
+	// If targetCols is empty, use all visible columns (automatic mapping)
+	if len(importCtx.targetCols) == 0 {
+		for _, col := range visibleCols {
+			targetCols = append(targetCols, col.GetName())
+		}
+	} else {
+		// Use explicitly specified columns
+		for _, col := range importCtx.targetCols {
+			targetCols = append(targetCols, string(col))
+		}
+	}
+
+	// Build the mapping: parquet column name (lowercase) -> table column index
+	for i, colName := range targetCols {
+		fieldNameToIdx[strings.ToLower(colName)] = i
+	}
+
+	// Validate type compatibility for columns that exist in both Parquet and table
+	for parquetColIdx := 0; parquetColIdx < parquetSchema.NumColumns(); parquetColIdx++ {
+		parquetCol := parquetSchema.Column(parquetColIdx)
+		parquetColName := parquetCol.Name()
+
+		// Find corresponding table column
+		tableColIdx, found := fieldNameToIdx[strings.ToLower(parquetColName)]
+		if !found {
+			// Column exists in Parquet but not in target table - that's okay, we'll skip it
+			continue
+		}
+
+		// Get target column type from the table descriptor
+		targetCol := visibleCols[tableColIdx]
+		targetType := targetCol.GetType()
+
+		// Validate type compatibility
+		if err := validateParquetTypeCompatibility(parquetCol, targetType); err != nil {
+			return nil, errors.Wrapf(err, "column %q", parquetColName)
+		}
+	}
+
+	// Validate that all required table columns are present in the Parquet file
+	// Required = non-nullable columns without defaults
+	for i, colName := range targetCols {
+		targetCol := visibleCols[i]
+
+		// Check if this column exists in the Parquet file (case-insensitive)
+		if !parquetColNames[strings.ToLower(colName)] {
+			// Column missing from Parquet file - check if it's required
+			if !targetCol.IsNullable() && !targetCol.HasDefault() && !targetCol.IsComputed() {
+				return nil, errors.Newf(
+					"required table column %q (non-nullable, no default) not found in Parquet file",
+					colName,
+				)
+			}
+			// Optional column (nullable or has default) - will be set to NULL or default value
+		}
+	}
+
+	return fieldNameToIdx, nil
+}
+
+// newParquetRowConsumer creates a consumer that converts Parquet rows to datums.
+func newParquetRowConsumer(
+	importCtx *parallelImportContext,
+	producer *parquetRowProducer,
+	fileCtx *importFileContext,
+	strict bool,
+) (*parquetRowConsumer, error) {
+
+	// Validate schema and build column mapping
+	fieldNameToIdx, err := validateAndBuildColumnMapping(importCtx, producer)
+	if err != nil {
+		return nil, err
 	}
 
 	return &parquetRowConsumer{

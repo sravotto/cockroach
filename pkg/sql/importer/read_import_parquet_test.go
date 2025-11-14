@@ -285,7 +285,9 @@ func TestConvertParquetValueToDatum(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logicalType := tc.logicalType
 			convertedType := tc.convertedType
-			if convertedType == schema.ConvertedTypes.None && logicalType == nil {
+			// If no explicit convertedType was set (has zero/default value), default to None
+			// Note: The zero value is UTF8 (0), so we need to explicitly set to None
+			if tc.logicalType == nil && tc.convertedType == 0 {
 				convertedType = schema.ConvertedTypes.None
 			}
 			result, err := convertParquetValueToDatum(tc.value, tc.targetType, logicalType, convertedType)
@@ -298,6 +300,16 @@ func TestConvertParquetValueToDatum(t *testing.T) {
 			// Special handling for UUID since we can't predict the exact value
 			if tc.targetType.Family() == types.UuidFamily && tc.name == "fixed-len-bytes-to-uuid" {
 				require.Equal(t, types.UuidFamily, result.ResolvedType().Family())
+			} else if result.ResolvedType().Family() == types.BytesFamily {
+				// For bytes, compare the actual byte values
+				expectedBytes := tree.MustBeDBytes(tc.expected)
+				resultBytes := tree.MustBeDBytes(result)
+				require.Equal(t, []byte(expectedBytes), []byte(resultBytes))
+			} else if result.ResolvedType().Family() == types.DecimalFamily {
+				// For decimals, compare decimal values directly
+				expectedDec := tree.MustBeDDecimal(tc.expected)
+				resultDec := tree.MustBeDDecimal(result)
+				require.Equal(t, expectedDec.String(), resultDec.String())
 			} else {
 				require.Equal(t, tc.expected.String(), result.String())
 			}
