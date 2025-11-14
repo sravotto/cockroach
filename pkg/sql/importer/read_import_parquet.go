@@ -13,6 +13,7 @@ import (
 
 	"github.com/apache/arrow/go/v11/parquet"
 	"github.com/apache/arrow/go/v11/parquet/file"
+	"github.com/apache/arrow/go/v11/parquet/schema"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -22,6 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
@@ -329,7 +333,6 @@ func (p *parquetRowProducer) Row() (interface{}, error) {
 	// Move to next buffered row and update progress
 	p.currentBufferedRow++
 	p.rowsProcessed++
-
 	return row, nil
 }
 
@@ -474,6 +477,33 @@ func newParquetRowConsumer(
 		fieldNameToIdx[strings.ToLower(string(col))] = i
 	}
 
+	// Validate type compatibility between Parquet columns and target table columns
+	parquetSchema := producer.reader.MetaData().Schema
+	visibleCols := importCtx.tableDesc.VisibleColumns()
+	log.Dev.Infof(context.Background(), "validate cols %v", importCtx.targetCols)
+	for parquetColIdx := 0; parquetColIdx < parquetSchema.NumColumns(); parquetColIdx++ {
+
+		parquetCol := parquetSchema.Column(parquetColIdx)
+		parquetColName := parquetCol.Name()
+
+		// Find corresponding table column
+		tableColIdx, found := fieldNameToIdx[strings.ToLower(parquetColName)]
+		if !found {
+			// Column exists in Parquet but not in target table - that's okay, we'll skip it
+			continue
+		}
+
+		// Get target column type from the table descriptor
+		targetCol := visibleCols[tableColIdx]
+		targetType := targetCol.GetType()
+		log.Dev.Infof(context.Background(), "column %s: %s -> %s",
+			parquetColName, parquetCol.LogicalType(), targetType)
+		// Validate type compatibility
+		if err := validateParquetTypeCompatibility(parquetCol, targetType); err != nil {
+			return nil, errors.Wrapf(err, "column %q", parquetColName)
+		}
+	}
+
 	return &parquetRowConsumer{
 		importCtx:      importCtx,
 		fieldNameToIdx: fieldNameToIdx,
@@ -496,8 +526,9 @@ func (c *parquetRowConsumer) FillDatums(
 
 	// For each column in the Parquet file, find the corresponding table column
 	for parquetColIdx, value := range parquetRow {
-		// Get Parquet column name from schema
-		parquetColName := c.reader.MetaData().Schema.Column(parquetColIdx).Name()
+		// Get Parquet column metadata from schema
+		col := c.reader.MetaData().Schema.Column(parquetColIdx)
+		parquetColName := col.Name()
 
 		// Map to table column index
 		tableColIdx, found := c.fieldNameToIdx[strings.ToLower(parquetColName)]
@@ -515,7 +546,7 @@ func (c *parquetRowConsumer) FillDatums(
 			targetType := conv.VisibleColTypes[tableColIdx]
 
 			var err error
-			datum, err = convertParquetValueToDatum(value, targetType)
+			datum, err = convertParquetValueToDatum(value, targetType, col.LogicalType(), col.ConvertedType())
 			if err != nil {
 				return newImportRowError(err, fmt.Sprintf("row %d", rowNum), rowNum)
 			}
@@ -537,27 +568,196 @@ func (c *parquetRowConsumer) FillDatums(
 }
 
 // convertParquetValueToDatum converts a raw Parquet value to a CRDB datum.
-// This performs basic type conversions - more complex types (arrays, nested)
-// would need additional handling.
+// This uses the Parquet logical type information to make more semantically
+// correct conversions. For example, a BYTE_ARRAY with String logical type
+// will be treated as a string rather than raw bytes.
 func convertParquetValueToDatum(
-	value interface{}, targetType *types.T,
+	value interface{},
+	targetType *types.T,
+	logicalType schema.LogicalType,
+	convertedType schema.ConvertedType,
 ) (tree.Datum, error) {
 	// Type switch on the value type and convert to appropriate datum
 	switch v := value.(type) {
 	case bool:
 		return tree.MakeDBool(tree.DBool(v)), nil
+
 	case int32:
+		// Check for Date logical type (days since Unix epoch)
+		if logicalType != nil {
+			if _, ok := logicalType.(*schema.DateLogicalType); ok {
+				// Convert days since Unix epoch (1970-01-01) to pgdate
+				// Parquet dates are stored as days from Unix epoch
+				d, err := pgdate.MakeDateFromUnixEpoch(int64(v))
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDDate(d), nil
+			}
+		}
+		// Check converted type for backward compatibility
+		if convertedType == schema.ConvertedTypes.Date {
+			d, err := pgdate.MakeDateFromUnixEpoch(int64(v))
+			if err != nil {
+				return nil, err
+			}
+			return tree.NewDDate(d), nil
+		}
+
+		// Check for Time logical type (milliseconds since midnight)
+		if logicalType != nil {
+			if timeType, ok := logicalType.(*schema.TimeLogicalType); ok {
+				if timeType.TimeUnit() == schema.TimeUnitMillis {
+					// Convert milliseconds to microseconds (CockroachDB uses microseconds)
+					micros := int64(v) * 1000
+					return tree.MakeDTime(timeofday.TimeOfDay(micros)), nil
+				}
+			}
+		}
+		// Check converted type for TIME_MILLIS
+		if convertedType == schema.ConvertedTypes.TimeMillis {
+			micros := int64(v) * 1000
+			return tree.MakeDTime(timeofday.TimeOfDay(micros)), nil
+		}
+
+		// Check for Decimal logical type
+		if logicalType != nil {
+			if decType, ok := logicalType.(*schema.DecimalLogicalType); ok {
+				// For int32-based decimals, the value is stored as unscaled
+				// e.g., for 123.45 with scale=2, the value is stored as 12345
+				// We need to format it as a decimal string with the correct scale
+				scale := decType.Scale()
+				if scale == 0 {
+					return tree.ParseDDecimal(fmt.Sprintf("%d", v))
+				}
+				// Format as decimal with scale decimal places
+				// For value=12345, scale=2 -> "123.45"
+				isNegative := v < 0
+				absVal := v
+				if isNegative {
+					absVal = -v
+				}
+
+				divisor := int32(1)
+				for i := int32(0); i < scale; i++ {
+					divisor *= 10
+				}
+				intPart := absVal / divisor
+				fracPart := absVal % divisor
+
+				var result string
+				if isNegative {
+					result = fmt.Sprintf("-%d.%0*d", intPart, scale, fracPart)
+				} else {
+					result = fmt.Sprintf("%d.%0*d", intPart, scale, fracPart)
+				}
+				return tree.ParseDDecimal(result)
+			}
+		}
+		// Check converted type for DECIMAL
+		if convertedType == schema.ConvertedTypes.Decimal {
+			// Without logical type, we don't have scale/precision, treat as integer
+			return tree.ParseDDecimal(fmt.Sprintf("%d", v))
+		}
+
 		// Check if target is decimal
 		if targetType.Family() == types.DecimalFamily {
 			return tree.ParseDDecimal(fmt.Sprintf("%d", v))
 		}
 		return tree.NewDInt(tree.DInt(v)), nil
+
 	case int64:
+		// Check for Timestamp logical type
+		if logicalType != nil {
+			if tsType, ok := logicalType.(*schema.TimestampLogicalType); ok {
+				// Convert based on time unit
+				var ts time.Time
+				switch tsType.TimeUnit() {
+				case schema.TimeUnitMillis:
+					// Milliseconds since Unix epoch
+					ts = time.Unix(v/1000, (v%1000)*1000000).UTC()
+				case schema.TimeUnitMicros:
+					// Microseconds since Unix epoch
+					ts = time.Unix(v/1000000, (v%1000000)*1000).UTC()
+				case schema.TimeUnitNanos:
+					// Nanoseconds since Unix epoch
+					ts = time.Unix(v/1000000000, v%1000000000).UTC()
+				}
+				return tree.MakeDTimestampTZ(ts, time.Microsecond)
+			}
+		}
+		// Check converted type for TIMESTAMP_MILLIS/MICROS
+		if convertedType == schema.ConvertedTypes.TimestampMillis {
+			ts := time.Unix(v/1000, (v%1000)*1000000).UTC()
+			return tree.MakeDTimestampTZ(ts, time.Microsecond)
+		}
+		if convertedType == schema.ConvertedTypes.TimestampMicros {
+			ts := time.Unix(v/1000000, (v%1000000)*1000).UTC()
+			return tree.MakeDTimestampTZ(ts, time.Microsecond)
+		}
+
+		// Check for Time logical type (microseconds or nanoseconds since midnight)
+		if logicalType != nil {
+			if timeType, ok := logicalType.(*schema.TimeLogicalType); ok {
+				var micros int64
+				switch timeType.TimeUnit() {
+				case schema.TimeUnitMicros:
+					micros = v
+				case schema.TimeUnitNanos:
+					micros = v / 1000
+				}
+				return tree.MakeDTime(timeofday.TimeOfDay(micros)), nil
+			}
+		}
+		// Check converted type for TIME_MICROS
+		if convertedType == schema.ConvertedTypes.TimeMicros {
+			return tree.MakeDTime(timeofday.TimeOfDay(v)), nil
+		}
+
+		// Check for Decimal logical type
+		if logicalType != nil {
+			if decType, ok := logicalType.(*schema.DecimalLogicalType); ok {
+				// For int64-based decimals, the value is stored as unscaled
+				// e.g., for 12345.6789 with scale=4, the value is stored as 123456789
+				scale := decType.Scale()
+				if scale == 0 {
+					return tree.ParseDDecimal(fmt.Sprintf("%d", v))
+				}
+				// Format as decimal with scale decimal places
+				isNegative := v < 0
+				absVal := v
+				if isNegative {
+					absVal = -v
+				}
+
+				divisor := int64(1)
+				for i := int32(0); i < scale; i++ {
+					divisor *= 10
+				}
+				intPart := absVal / divisor
+				fracPart := absVal % divisor
+
+				var result string
+				if isNegative {
+					result = fmt.Sprintf("-%d.%0*d", intPart, scale, fracPart)
+				} else {
+					result = fmt.Sprintf("%d.%0*d", intPart, scale, fracPart)
+				}
+				return tree.ParseDDecimal(result)
+			}
+		}
+		// Check converted type for DECIMAL
+		if convertedType == schema.ConvertedTypes.Decimal {
+			// Without logical type, we don't have scale/precision, treat as integer
+			return tree.ParseDDecimal(fmt.Sprintf("%d", v))
+		}
+
 		// Check if target is decimal
 		if targetType.Family() == types.DecimalFamily {
 			return tree.ParseDDecimal(fmt.Sprintf("%d", v))
 		}
 		return tree.NewDInt(tree.DInt(v)), nil
+
 	case float32:
 		// Check if target is decimal
 		if targetType.Family() == types.DecimalFamily {
@@ -565,6 +765,7 @@ func convertParquetValueToDatum(
 			return tree.ParseDDecimal(fmt.Sprintf("%g", v))
 		}
 		return tree.NewDFloat(tree.DFloat(v)), nil
+
 	case float64:
 		// Check if target is decimal
 		if targetType.Family() == types.DecimalFamily {
@@ -573,8 +774,33 @@ func convertParquetValueToDatum(
 			return tree.ParseDDecimal(fmt.Sprintf("%g", v))
 		}
 		return tree.NewDFloat(tree.DFloat(v)), nil
+
 	case []byte:
-		// ByteArray - handle based on target column type
+		// ByteArray - use logical type to determine semantic meaning
+		// Check for String logical type first (more specific than converted type)
+		if logicalType != nil {
+			if _, ok := logicalType.(*schema.StringLogicalType); ok {
+				// Parquet String logical type should always be treated as string
+				return tree.NewDString(string(v)), nil
+			}
+		}
+
+		// Check converted type for backward compatibility
+		if convertedType == schema.ConvertedTypes.UTF8 {
+			return tree.NewDString(string(v)), nil
+		}
+
+		// Check for JSON logical type
+		if logicalType != nil {
+			if _, ok := logicalType.(*schema.JSONLogicalType); ok {
+				if len(v) == 0 {
+					return tree.DNull, nil
+				}
+				return tree.ParseDJSON(string(v))
+			}
+		}
+
+		// Fall back to target column type for remaining cases
 		switch targetType.Family() {
 		case types.StringFamily:
 			return tree.NewDString(string(v)), nil
@@ -604,9 +830,16 @@ func convertParquetValueToDatum(
 			}
 			return tree.ParseDJSON(string(v))
 		default:
+			// If we have a String logical type but unknown target, prefer string
+			if logicalType != nil {
+				if _, ok := logicalType.(*schema.StringLogicalType); ok {
+					return tree.NewDString(string(v)), nil
+				}
+			}
 			// Default to string for unknown types
 			return tree.NewDString(string(v)), nil
 		}
+
 	case parquet.FixedLenByteArray:
 		// Used for UUIDs, fixed-length types
 		if targetType.Family() == types.UuidFamily {
@@ -617,7 +850,196 @@ func convertParquetValueToDatum(
 			return tree.NewDUuid(tree.DUuid{UUID: uid}), nil
 		}
 		return tree.NewDBytes(tree.DBytes(v)), nil
+
 	default:
 		return nil, errors.Newf("unsupported Parquet value type: %T", value)
 	}
+}
+
+// validateParquetTypeCompatibility checks if a Parquet column can be converted to a target CockroachDB type.
+func validateParquetTypeCompatibility(parquetCol *schema.Column, targetType *types.T) error {
+	physicalType := parquetCol.PhysicalType()
+	logicalType := parquetCol.LogicalType()
+	convertedType := parquetCol.ConvertedType()
+
+	// Check compatibility based on physical type and logical type
+	switch physicalType {
+	case parquet.Types.Boolean:
+		// Boolean can only go to Bool
+		if targetType.Family() != types.BoolFamily {
+			return errors.Newf("boolean type cannot be converted to %s", targetType.Family())
+		}
+
+	case parquet.Types.Int32:
+		// Check for special logical types first
+		if logicalType != nil {
+			if _, ok := logicalType.(*schema.DateLogicalType); ok {
+				if targetType.Family() != types.DateFamily {
+					return errors.Newf("Date logical type requires DATE target, got %s", targetType.Family())
+				}
+				return nil
+			}
+			if timeType, ok := logicalType.(*schema.TimeLogicalType); ok {
+				if timeType.TimeUnit() == schema.TimeUnitMillis {
+					if targetType.Family() != types.TimeFamily {
+						return errors.Newf("Time logical type requires TIME target, got %s", targetType.Family())
+					}
+					return nil
+				}
+			}
+			if _, ok := logicalType.(*schema.DecimalLogicalType); ok {
+				if targetType.Family() != types.DecimalFamily && targetType.Family() != types.IntFamily {
+					return errors.Newf("Decimal logical type requires DECIMAL or INT target, got %s", targetType.Family())
+				}
+				return nil
+			}
+		}
+
+		// Check converted types for backward compatibility
+		if convertedType == schema.ConvertedTypes.Date {
+			if targetType.Family() != types.DateFamily {
+				return errors.Newf("Date converted type requires DATE target, got %s", targetType.Family())
+			}
+			return nil
+		}
+		if convertedType == schema.ConvertedTypes.TimeMillis {
+			if targetType.Family() != types.TimeFamily {
+				return errors.Newf("Time converted type requires TIME target, got %s", targetType.Family())
+			}
+			return nil
+		}
+		if convertedType == schema.ConvertedTypes.Decimal {
+			if targetType.Family() != types.DecimalFamily && targetType.Family() != types.IntFamily {
+				return errors.Newf("Decimal converted type requires DECIMAL or INT target, got %s", targetType.Family())
+			}
+			return nil
+		}
+
+		// Plain int32 - can go to Int or Decimal
+		if targetType.Family() != types.IntFamily && targetType.Family() != types.DecimalFamily {
+			return errors.Newf("int32 type can only be converted to INT or DECIMAL, got %s", targetType.Family())
+		}
+
+	case parquet.Types.Int64:
+		// Check for special logical types
+		if logicalType != nil {
+			if _, ok := logicalType.(*schema.TimestampLogicalType); ok {
+				if targetType.Family() != types.TimestampFamily && targetType.Family() != types.TimestampTZFamily {
+					return errors.Newf("Timestamp logical type requires TIMESTAMP/TIMESTAMPTZ target, got %s", targetType.Family())
+				}
+				return nil
+			}
+			if _, ok := logicalType.(*schema.TimeLogicalType); ok {
+				if targetType.Family() != types.TimeFamily {
+					return errors.Newf("Time logical type requires TIME target, got %s", targetType.Family())
+				}
+				return nil
+			}
+			if _, ok := logicalType.(*schema.DecimalLogicalType); ok {
+				if targetType.Family() != types.DecimalFamily && targetType.Family() != types.IntFamily {
+					return errors.Newf("Decimal logical type requires DECIMAL or INT target, got %s", targetType.Family())
+				}
+				return nil
+			}
+		}
+
+		// Check converted types
+		if convertedType == schema.ConvertedTypes.TimestampMillis || convertedType == schema.ConvertedTypes.TimestampMicros {
+			if targetType.Family() != types.TimestampFamily && targetType.Family() != types.TimestampTZFamily {
+				return errors.Newf("Timestamp converted type requires TIMESTAMP/TIMESTAMPTZ target, got %s", targetType.Family())
+			}
+			return nil
+		}
+		if convertedType == schema.ConvertedTypes.TimeMicros {
+			if targetType.Family() != types.TimeFamily {
+				return errors.Newf("Time converted type requires TIME target, got %s", targetType.Family())
+			}
+			return nil
+		}
+		if convertedType == schema.ConvertedTypes.Decimal {
+			if targetType.Family() != types.DecimalFamily && targetType.Family() != types.IntFamily {
+				return errors.Newf("Decimal converted type requires DECIMAL or INT target, got %s", targetType.Family())
+			}
+			return nil
+		}
+
+		// Plain int64 - can go to Int or Decimal
+		if targetType.Family() != types.IntFamily && targetType.Family() != types.DecimalFamily {
+			return errors.Newf("int64 type can only be converted to INT or DECIMAL, got %s", targetType.Family())
+		}
+
+	case parquet.Types.Float:
+		// Float32 can go to Float or Decimal
+		if targetType.Family() != types.FloatFamily && targetType.Family() != types.DecimalFamily {
+			return errors.Newf("float type can only be converted to FLOAT or DECIMAL, got %s", targetType.Family())
+		}
+
+	case parquet.Types.Double:
+		// Float64 can go to Float or Decimal
+		if targetType.Family() != types.FloatFamily && targetType.Family() != types.DecimalFamily {
+			return errors.Newf("double type can only be converted to FLOAT or DECIMAL, got %s", targetType.Family())
+		}
+
+	case parquet.Types.ByteArray:
+		// ByteArray is very flexible
+		// Check for String logical type
+		if logicalType != nil {
+			if _, ok := logicalType.(*schema.StringLogicalType); ok {
+				if targetType.Family() != types.StringFamily && targetType.Family() != types.BytesFamily {
+					return errors.Newf("String logical type should target STRING or BYTES, got %s", targetType.Family())
+				}
+				return nil
+			}
+			if _, ok := logicalType.(*schema.JSONLogicalType); ok {
+				if targetType.Family() != types.JsonFamily {
+					return errors.Newf("JSON logical type requires JSONB target, got %s", targetType.Family())
+				}
+				return nil
+			}
+		}
+
+		// Check converted type
+		if convertedType == schema.ConvertedTypes.UTF8 {
+			if targetType.Family() != types.StringFamily && targetType.Family() != types.BytesFamily {
+				return errors.Newf("UTF8 converted type should target STRING or BYTES, got %s", targetType.Family())
+			}
+			return nil
+		}
+
+		// Plain ByteArray can go to String, Bytes, or be parsed as Timestamp/Decimal/JSON
+		// We allow these flexible conversions
+		validFamilies := []types.Family{
+			types.StringFamily,
+			types.BytesFamily,
+			types.TimestampFamily,
+			types.TimestampTZFamily,
+			types.DecimalFamily,
+			types.JsonFamily,
+		}
+		for _, family := range validFamilies {
+			if targetType.Family() == family {
+				return nil
+			}
+		}
+		return errors.Newf("byte array type cannot be converted to %s", targetType.Family())
+
+	case parquet.Types.FixedLenByteArray:
+		// FixedLenByteArray can go to UUID, Bytes, or String
+		validFamilies := []types.Family{
+			types.UuidFamily,
+			types.BytesFamily,
+			types.StringFamily,
+		}
+		for _, family := range validFamilies {
+			if targetType.Family() == family {
+				return nil
+			}
+		}
+		return errors.Newf("fixed-length byte array type cannot be converted to %s", targetType.Family())
+
+	default:
+		return errors.Newf("unsupported Parquet physical type: %v", physicalType)
+	}
+
+	return nil
 }

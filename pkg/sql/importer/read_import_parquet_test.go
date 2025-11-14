@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow/go/v11/arrow"
 	"github.com/apache/arrow/go/v11/arrow/array"
@@ -17,11 +18,14 @@ import (
 	"github.com/apache/arrow/go/v11/parquet"
 	"github.com/apache/arrow/go/v11/parquet/compress"
 	"github.com/apache/arrow/go/v11/parquet/pqarrow"
+	"github.com/apache/arrow/go/v11/parquet/schema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -32,11 +36,13 @@ func TestConvertParquetValueToDatum(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	tests := []struct {
-		name       string
-		value      interface{}
-		targetType *types.T
-		expected   tree.Datum
-		expectErr  bool
+		name          string
+		value         interface{}
+		targetType    *types.T
+		logicalType   schema.LogicalType
+		convertedType schema.ConvertedType
+		expected      tree.Datum
+		expectErr     bool
 	}{
 		{
 			name:       "bool-true",
@@ -128,11 +134,158 @@ func TestConvertParquetValueToDatum(t *testing.T) {
 			targetType: types.String,
 			expectErr:  true,
 		},
+
+		// Date logical types
+		{
+			name:          "int32-date-logical-type",
+			value:         int32(18262), // 2020-01-01
+			targetType:    types.Date,
+			logicalType:   &schema.DateLogicalType{},
+			convertedType: schema.ConvertedTypes.None,
+			expected: func() tree.Datum {
+				d, _ := pgdate.MakeDateFromUnixEpoch(18262)
+				return tree.NewDDate(d)
+			}(),
+		},
+		{
+			name:          "int32-date-converted-type",
+			value:         int32(0), // 1970-01-01 (epoch)
+			targetType:    types.Date,
+			logicalType:   nil,
+			convertedType: schema.ConvertedTypes.Date,
+			expected: func() tree.Datum {
+				d, _ := pgdate.MakeDateFromUnixEpoch(0)
+				return tree.NewDDate(d)
+			}(),
+		},
+
+		// Time logical types
+		{
+			name:          "int32-time-millis-logical-type",
+			value:         int32(36000000), // 10:00:00
+			targetType:    types.Time,
+			logicalType:   schema.NewTimeLogicalType(false, schema.TimeUnitMillis),
+			convertedType: schema.ConvertedTypes.None,
+			expected:      tree.MakeDTime(timeofday.TimeOfDay(36000000000)), // 36000000ms * 1000 = 36000000000µs
+		},
+		{
+			name:          "int32-time-millis-converted-type",
+			value:         int32(3600000), // 01:00:00
+			targetType:    types.Time,
+			logicalType:   nil,
+			convertedType: schema.ConvertedTypes.TimeMillis,
+			expected:      tree.MakeDTime(timeofday.TimeOfDay(3600000000)), // 3600000ms * 1000 = 3600000000µs
+		},
+		{
+			name:          "int64-time-micros-logical-type",
+			value:         int64(36000000000), // 10:00:00
+			targetType:    types.Time,
+			logicalType:   schema.NewTimeLogicalType(false, schema.TimeUnitMicros),
+			convertedType: schema.ConvertedTypes.None,
+			expected:      tree.MakeDTime(timeofday.TimeOfDay(36000000000)),
+		},
+		{
+			name:          "int64-time-micros-converted-type",
+			value:         int64(3600000000), // 01:00:00
+			targetType:    types.Time,
+			logicalType:   nil,
+			convertedType: schema.ConvertedTypes.TimeMicros,
+			expected:      tree.MakeDTime(timeofday.TimeOfDay(3600000000)),
+		},
+
+		// Timestamp logical types
+		{
+			name:          "int64-timestamp-millis-logical-type",
+			value:         int64(1577836800000), // 2020-01-01 00:00:00 UTC
+			targetType:    types.TimestampTZ,
+			logicalType:   schema.NewTimestampLogicalType(true, schema.TimeUnitMillis),
+			convertedType: schema.ConvertedTypes.None,
+			expected: func() tree.Datum {
+				ts := time.Unix(1577836800, 0).UTC()
+				d, _ := tree.MakeDTimestampTZ(ts, time.Microsecond)
+				return d
+			}(),
+		},
+		{
+			name:          "int64-timestamp-micros-logical-type",
+			value:         int64(1577836800000000), // 2020-01-01 00:00:00 UTC
+			targetType:    types.TimestampTZ,
+			logicalType:   schema.NewTimestampLogicalType(true, schema.TimeUnitMicros),
+			convertedType: schema.ConvertedTypes.None,
+			expected: func() tree.Datum {
+				ts := time.Unix(1577836800, 0).UTC()
+				d, _ := tree.MakeDTimestampTZ(ts, time.Microsecond)
+				return d
+			}(),
+		},
+		{
+			name:          "int64-timestamp-millis-converted-type",
+			value:         int64(1577836800000), // 2020-01-01 00:00:00 UTC
+			targetType:    types.TimestampTZ,
+			logicalType:   nil,
+			convertedType: schema.ConvertedTypes.TimestampMillis,
+			expected: func() tree.Datum {
+				ts := time.Unix(1577836800, 0).UTC()
+				d, _ := tree.MakeDTimestampTZ(ts, time.Microsecond)
+				return d
+			}(),
+		},
+		{
+			name:          "int64-timestamp-micros-converted-type",
+			value:         int64(1577836800000000), // 2020-01-01 00:00:00 UTC
+			targetType:    types.TimestampTZ,
+			logicalType:   nil,
+			convertedType: schema.ConvertedTypes.TimestampMicros,
+			expected: func() tree.Datum {
+				ts := time.Unix(1577836800, 0).UTC()
+				d, _ := tree.MakeDTimestampTZ(ts, time.Microsecond)
+				return d
+			}(),
+		},
+
+		// Decimal logical types
+		{
+			name:          "int32-decimal-scale-2",
+			value:         int32(12345), // 123.45
+			targetType:    types.Decimal,
+			logicalType:   schema.NewDecimalLogicalType(10, 2),
+			convertedType: schema.ConvertedTypes.None,
+			expected:      func() tree.Datum { d, _ := tree.ParseDDecimal("123.45"); return d }(),
+		},
+		{
+			name:          "int32-decimal-scale-0",
+			value:         int32(12345),
+			targetType:    types.Decimal,
+			logicalType:   schema.NewDecimalLogicalType(10, 0),
+			convertedType: schema.ConvertedTypes.None,
+			expected:      func() tree.Datum { d, _ := tree.ParseDDecimal("12345"); return d }(),
+		},
+		{
+			name:          "int64-decimal-scale-4",
+			value:         int64(123456789), // 12345.6789
+			targetType:    types.Decimal,
+			logicalType:   schema.NewDecimalLogicalType(20, 4),
+			convertedType: schema.ConvertedTypes.None,
+			expected:      func() tree.Datum { d, _ := tree.ParseDDecimal("12345.6789"); return d }(),
+		},
+		{
+			name:          "int32-decimal-negative",
+			value:         int32(-12345), // -123.45
+			targetType:    types.Decimal,
+			logicalType:   schema.NewDecimalLogicalType(10, 2),
+			convertedType: schema.ConvertedTypes.None,
+			expected:      func() tree.Datum { d, _ := tree.ParseDDecimal("-123.45"); return d }(),
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := convertParquetValueToDatum(tc.value, tc.targetType)
+			logicalType := tc.logicalType
+			convertedType := tc.convertedType
+			if convertedType == schema.ConvertedTypes.None && logicalType == nil {
+				convertedType = schema.ConvertedTypes.None
+			}
+			result, err := convertParquetValueToDatum(tc.value, tc.targetType, logicalType, convertedType)
 			if tc.expectErr {
 				require.Error(t, err)
 				return
@@ -704,7 +857,7 @@ func TestParquetReadTitanicFile(t *testing.T) {
 	// Print schema
 	for i := 0; i < producer.numColumns; i++ {
 		col := producer.reader.MetaData().Schema.Column(i)
-		t.Logf("Column %d: %s (type: %s)", i, col.Name(), col.PhysicalType())
+		t.Logf("Column %d: %s (type: %s, logical: %v, converted: %v)", i, col.Name(), col.PhysicalType(), col.LogicalType(), col.ConvertedType())
 	}
 
 	// Read all rows and collect the last 5
