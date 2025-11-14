@@ -40,9 +40,10 @@ type parquetRowProducer struct {
 	rowsInGroup       int64 // Number of rows in current row group
 	currentRowInGroup int64 // Current position within row group
 
-	// Column readers for current row group
-	columnReaders []file.ColumnChunkReader
-	numColumns    int
+	// Column selection - which Parquet columns to actually read
+	columnsToRead []int                          // Parquet column indices to read
+	numColumns    int                            // Total number of columns in Parquet file
+	columnReaders map[int]file.ColumnChunkReader // Maps Parquet column index -> reader
 
 	// Batching configuration
 	batchSize int64 // Number of rows to read in a single batch
@@ -58,7 +59,8 @@ type parquetRowProducer struct {
 	defLevels []int16 // Definition levels (for NULL handling)
 	repLevels []int16 // Repetition levels (for arrays)
 
-	// Row buffering - stores N rows worth of values from all columns
+	// Row buffering - stores N rows worth of values from all columns (sparse)
+	// Only columns in columnsToRead will have non-nil values
 	bufferedValues     [][]interface{} // [column][row] - values for each column
 	bufferedRowCount   int64           // Number of rows currently buffered
 	currentBufferedRow int64           // Which buffered row to return next
@@ -142,8 +144,8 @@ func (p *parquetInputReader) readFile(
 		rejected: rejected,
 	}
 
-	// Create row producer
-	producer, err := newParquetRowProducer(input)
+	// Create row producer - it will open the file and determine which columns to read
+	producer, err := newParquetRowProducer(input, p.importCtx)
 	if err != nil {
 		return err
 	}
@@ -162,8 +164,11 @@ func (p *parquetInputReader) readFile(
 const defaultParquetBatchSize = 100
 
 // newParquetRowProducer creates a new Parquet row producer from a fileReader.
-func newParquetRowProducer(input *fileReader) (*parquetRowProducer, error) {
+// It opens the Parquet file and determines which columns to read based on importCtx.
+// If importCtx is nil, all columns are read (useful for tests).
+func newParquetRowProducer(input *fileReader, importCtx *parallelImportContext) (*parquetRowProducer, error) {
 
+	// Open Parquet file
 	reader, err := file.NewParquetReader(input)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to open Parquet file")
@@ -179,10 +184,25 @@ func newParquetRowProducer(input *fileReader) (*parquetRowProducer, error) {
 	numColumns := reader.MetaData().Schema.NumColumns()
 	batchSize := int64(defaultParquetBatchSize)
 
+	// Determine which columns to read
+	var columnsToRead []int
+	if importCtx == nil {
+		// No import context (test mode) - read all columns
+		columnsToRead = make([]int, numColumns)
+		for i := 0; i < numColumns; i++ {
+			columnsToRead[i] = i
+		}
+	} else {
+		// Determine which Parquet columns to read based on target table columns
+		parquetSchema := reader.MetaData().Schema
+		columnsToRead = determineColumnsToRead(importCtx, parquetSchema)
+	}
+
 	return &parquetRowProducer{
 		reader:          reader,
 		currentRowGroup: -1, // Start at -1 so first advance goes to 0
 		totalRowGroups:  totalRowGroups,
+		columnsToRead:   columnsToRead,
 		numColumns:      numColumns,
 		totalRows:       totalRows,
 		rowsProcessed:   0,
@@ -197,7 +217,7 @@ func newParquetRowProducer(input *fileReader) (*parquetRowProducer, error) {
 		defLevels:  make([]int16, batchSize),
 		repLevels:  make([]int16, batchSize),
 
-		// Initialize row buffering
+		// Initialize row buffering (sparse array - only read columns will have values)
 		bufferedValues:     make([][]interface{}, numColumns),
 		bufferedRowCount:   0,
 		currentBufferedRow: 0,
@@ -262,9 +282,9 @@ func (p *parquetRowProducer) advanceToNextRowGroup() error {
 	p.rowsInGroup = rowGroup.NumRows()
 	p.currentRowInGroup = 0
 
-	// Set up column chunk readers for all columns in this row group
-	p.columnReaders = make([]file.ColumnChunkReader, p.numColumns)
-	for colIdx := 0; colIdx < p.numColumns; colIdx++ {
+	// Set up column chunk readers only for columns we need to read
+	p.columnReaders = make(map[int]file.ColumnChunkReader, len(p.columnsToRead))
+	for _, colIdx := range p.columnsToRead {
 		colReader, err := rowGroup.Column(colIdx)
 		if err != nil {
 			return errors.Wrapf(err, "failed to get column reader for column %d", colIdx)
@@ -275,8 +295,9 @@ func (p *parquetRowProducer) advanceToNextRowGroup() error {
 	return nil
 }
 
-// fillBuffer reads up to batchSize rows from all columns and stores them in bufferedValues.
+// fillBuffer reads up to batchSize rows from needed columns and stores them in bufferedValues.
 // This method reads N values from each column at once, improving performance.
+// Only columns in columnsToRead are actually read; other columns remain nil.
 func (p *parquetRowProducer) fillBuffer() error {
 	// Determine how many rows to read in this batch
 	// (might be less than batchSize at end of row group)
@@ -290,8 +311,8 @@ func (p *parquetRowProducer) fillBuffer() error {
 		return errors.New("fillBuffer called with no rows remaining")
 	}
 
-	// Read rowsToRead values from each column
-	for colIdx := 0; colIdx < p.numColumns; colIdx++ {
+	// Read rowsToRead values only from columns we need
+	for _, colIdx := range p.columnsToRead {
 		colReader := p.columnReaders[colIdx]
 
 		// Read a batch of values from this column
@@ -300,7 +321,7 @@ func (p *parquetRowProducer) fillBuffer() error {
 			return errors.Wrapf(err, "failed to read batch from column %d", colIdx)
 		}
 
-		// Store the values for this column
+		// Store the values for this column (sparse array - only needed columns populated)
 		p.bufferedValues[colIdx] = values
 	}
 
@@ -316,6 +337,7 @@ func (p *parquetRowProducer) fillBuffer() error {
 
 // Row returns the current row as a slice of interface{} values.
 // Each value is the raw Parquet value read from the column.
+// Only columns in columnsToRead will have non-nil values; others will be nil.
 // Scan() must be called before Row() to ensure the buffer is filled.
 func (p *parquetRowProducer) Row() (interface{}, error) {
 	if p.err != nil {
@@ -327,10 +349,14 @@ func (p *parquetRowProducer) Row() (interface{}, error) {
 		return nil, errors.New("Row() called without successful Scan()")
 	}
 
-	// Reconstruct the current row from buffered column values
+	// Reconstruct the current row from buffered column values (sparse array)
 	row := make([]interface{}, p.numColumns)
 	for colIdx := 0; colIdx < p.numColumns; colIdx++ {
-		row[colIdx] = p.bufferedValues[colIdx][p.currentBufferedRow]
+		// Only access buffered values for columns we actually read
+		if p.bufferedValues[colIdx] != nil {
+			row[colIdx] = p.bufferedValues[colIdx][p.currentBufferedRow]
+		}
+		// else row[colIdx] remains nil
 	}
 
 	// Move to next buffered row and update progress
@@ -467,6 +493,55 @@ func (p *parquetRowProducer) Progress() float32 {
 	return float32(p.rowsProcessed) / float32(p.totalRows)
 }
 
+// determineColumnsToRead determines which Parquet column indices need to be read
+// based on the target table columns. Returns the list of Parquet column indices.
+func determineColumnsToRead(
+	importCtx *parallelImportContext,
+	parquetSchema *schema.Schema,
+) []int {
+	// Determine which table columns we're importing into
+	var targetCols []string
+	if importCtx.tableDesc == nil {
+		// No table descriptor (test mode) - use targetCols as-is
+		for _, col := range importCtx.targetCols {
+			targetCols = append(targetCols, strings.ToLower(string(col)))
+		}
+	} else {
+		visibleCols := importCtx.tableDesc.VisibleColumns()
+		// If targetCols is empty, use all visible columns (automatic mapping)
+		if len(importCtx.targetCols) == 0 {
+			for _, col := range visibleCols {
+				targetCols = append(targetCols, strings.ToLower(col.GetName()))
+			}
+		} else {
+			// Use explicitly specified columns
+			for _, col := range importCtx.targetCols {
+				targetCols = append(targetCols, strings.ToLower(string(col)))
+			}
+		}
+	}
+
+	// Build set of target column names for quick lookup
+	targetColSet := make(map[string]bool)
+	for _, colName := range targetCols {
+		targetColSet[colName] = true
+	}
+
+	// Find which Parquet columns match our target columns
+	var columnsToRead []int
+	for parquetColIdx := 0; parquetColIdx < parquetSchema.NumColumns(); parquetColIdx++ {
+		parquetCol := parquetSchema.Column(parquetColIdx)
+		parquetColName := strings.ToLower(parquetCol.Name())
+
+		// If this Parquet column is in our target set, we need to read it
+		if targetColSet[parquetColName] {
+			columnsToRead = append(columnsToRead, parquetColIdx)
+		}
+	}
+
+	return columnsToRead
+}
+
 // validateAndBuildColumnMapping validates the Parquet schema against the table schema
 // and builds a mapping from Parquet column names to table column indices.
 func validateAndBuildColumnMapping(
@@ -512,15 +587,16 @@ func validateAndBuildColumnMapping(
 		fieldNameToIdx[strings.ToLower(colName)] = i
 	}
 
-	// Validate type compatibility for columns that exist in both Parquet and table
-	for parquetColIdx := 0; parquetColIdx < parquetSchema.NumColumns(); parquetColIdx++ {
+	// Validate type compatibility ONLY for columns we're actually reading.
+	for _, parquetColIdx := range producer.columnsToRead {
 		parquetCol := parquetSchema.Column(parquetColIdx)
 		parquetColName := parquetCol.Name()
 
 		// Find corresponding table column
 		tableColIdx, found := fieldNameToIdx[strings.ToLower(parquetColName)]
 		if !found {
-			// Column exists in Parquet but not in target table - that's okay, we'll skip it
+			// This shouldn't happen since columnsToRead was determined based on
+			// the target columns, but handle it defensively.
 			continue
 		}
 

@@ -409,7 +409,7 @@ func TestParquetRowProducerBasicScanning(t *testing.T) {
 				total:    int64(parquetData.Len()),
 			}
 
-			producer, err := newParquetRowProducer(fileReader)
+			producer, err := newParquetRowProducer(fileReader, nil)
 			require.NoError(t, err)
 			require.NotNil(t, producer)
 
@@ -455,7 +455,7 @@ func TestParquetRowProducerNullHandling(t *testing.T) {
 		total:    int64(parquetData.Len()),
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	rowCount := 0
@@ -503,7 +503,7 @@ func TestParquetRowProducerBatching(t *testing.T) {
 		total:    int64(parquetData.Len()),
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	// Should read in batches of 100 (defaultParquetBatchSize)
@@ -541,7 +541,7 @@ func TestParquetRowProducerProgress(t *testing.T) {
 		total:    int64(parquetData.Len()),
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	// Initial progress should be 0
@@ -583,7 +583,7 @@ func TestParquetRowProducerSingleRow(t *testing.T) {
 		total:    int64(parquetData.Len()),
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	// Should scan exactly one row
@@ -611,7 +611,7 @@ func TestParquetRowProducerSkip(t *testing.T) {
 		total:    int64(parquetData.Len()),
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	// Scan and skip first row
@@ -646,7 +646,7 @@ func TestParquetRowConsumerCreation(t *testing.T) {
 		Seeker:   reader,
 		total:    int64(parquetData.Len()),
 	}
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, false)
@@ -708,7 +708,7 @@ func TestParquetAutomaticColumnMapping(t *testing.T) {
 		Seeker:   reader,
 		total:    int64(parquetData.Len()),
 	}
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, false)
@@ -776,7 +776,7 @@ func TestParquetMissingRequiredColumn(t *testing.T) {
 		Seeker:   reader,
 		total:    int64(parquetData.Len()),
 	}
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	// Should fail because "email" is required (non-nullable, no default) but missing from Parquet
@@ -845,7 +845,7 @@ func TestParquetMultipleFloat64Columns(t *testing.T) {
 		total:    int64(buf.Len()),
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 	require.NotNil(t, producer)
 
@@ -934,7 +934,7 @@ func TestParquetMultipleFloat64ColumnsLargeFile(t *testing.T) {
 		total:    int64(buf.Len()),
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 
 	// Verify all rows
@@ -1041,7 +1041,7 @@ func TestParquetStrictValidation(t *testing.T) {
 			Seeker:   reader,
 			total:    int64(buf.Len()),
 		}
-		producer, err := newParquetRowProducer(fileReader)
+		producer, err := newParquetRowProducer(fileReader, nil)
 		require.NoError(t, err)
 
 		consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, false)
@@ -1070,7 +1070,7 @@ func TestParquetStrictValidation(t *testing.T) {
 			Seeker:   reader,
 			total:    int64(buf.Len()),
 		}
-		producer, err := newParquetRowProducer(fileReader)
+		producer, err := newParquetRowProducer(fileReader, nil)
 		require.NoError(t, err)
 
 		consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, true)
@@ -1110,7 +1110,7 @@ func TestParquetReadTitanicFile(t *testing.T) {
 		total:    stat.Size(),
 	}
 
-	producer, err := newParquetRowProducer(fileReader)
+	producer, err := newParquetRowProducer(fileReader, nil)
 	require.NoError(t, err)
 	require.NotNil(t, producer)
 
