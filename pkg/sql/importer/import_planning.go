@@ -72,8 +72,9 @@ const (
 
 	optMaxRowSize = "max_row_size"
 
-	// Turn on strict validation when importing avro records.
-	avroStrict = "strict_validation"
+	// Turn on strict validation when importing avro or parquet records.
+	optStrictValidation = "strict_validation"
+
 	// Default input format is assumed to be OCF (object container file).
 	// This default can be changed by specified either of these options.
 	avroBinRecords  = "data_as_binary_records"
@@ -108,7 +109,7 @@ var importOptionExpectValues = map[string]exprutil.KVStringOptValidate{
 
 	optMaxRowSize: exprutil.KVStringOptRequireValue,
 
-	avroStrict:             exprutil.KVStringOptRequireNoValue,
+	optStrictValidation:    exprutil.KVStringOptRequireNoValue,
 	avroSchema:             exprutil.KVStringOptRequireValue,
 	avroSchemaURI:          exprutil.KVStringOptRequireValue,
 	avroRecordsSeparatedBy: exprutil.KVStringOptRequireValue,
@@ -131,7 +132,7 @@ var allowedCommonOptions = makeStringSet(
 
 // Format specific allowed options.
 var avroAllowedOptions = makeStringSet(
-	avroStrict, avroBinRecords, avroJSONRecords,
+	optStrictValidation, avroBinRecords, avroJSONRecords,
 	avroRecordsSeparatedBy, avroSchema, avroSchemaURI, optMaxRowSize, csvRowLimit,
 )
 
@@ -146,7 +147,7 @@ var mysqlOutAllowedOptions = makeStringSet(
 
 var pgCopyAllowedOptions = makeStringSet(pgCopyDelimiter, pgCopyNull, optMaxRowSize)
 
-var parquetAllowedOptions = makeStringSet()
+var parquetAllowedOptions = makeStringSet(optStrictValidation)
 
 // DROP is required because the target table needs to be take offline during
 // IMPORT INTO.
@@ -616,7 +617,7 @@ func importPlanHook(
 			return err
 		}
 		format.Format = roachpb.IOFileFormat_Parquet
-		// Parquet files contain their own schema, so no additional format options needed
+		_, format.Parquet.StrictMode = opts[optStrictValidation]
 	default:
 		return unimplemented.Newf("import.format", "unsupported import format: %q", importStmt.FileFormat)
 		}
@@ -869,7 +870,7 @@ func parseAvroOptions(
 	format.Format = roachpb.IOFileFormat_Avro
 	// Default input format is OCF.
 	format.Avro.Format = roachpb.AvroOptions_OCF
-	_, format.Avro.StrictMode = opts[avroStrict]
+	_, format.Avro.StrictMode = opts[optStrictValidation]
 
 	_, haveBinRecs := opts[avroBinRecords]
 	_, haveJSONRecs := opts[avroJSONRecords]

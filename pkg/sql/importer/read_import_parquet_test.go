@@ -19,6 +19,9 @@ import (
 	"github.com/apache/arrow/go/v11/parquet/compress"
 	"github.com/apache/arrow/go/v11/parquet/pqarrow"
 	"github.com/apache/arrow/go/v11/parquet/schema"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
@@ -634,7 +637,7 @@ func TestParquetRowConsumerCreation(t *testing.T) {
 	producer, err := newParquetRowProducer(fileReader)
 	require.NoError(t, err)
 
-	consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{})
+	consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, false)
 	require.NoError(t, err)
 	require.NotNil(t, consumer)
 
@@ -644,6 +647,132 @@ func TestParquetRowConsumerCreation(t *testing.T) {
 	require.Contains(t, consumer.fieldNameToIdx, "name")
 	require.Contains(t, consumer.fieldNameToIdx, "score")
 	require.Contains(t, consumer.fieldNameToIdx, "active")
+}
+
+// TestParquetAutomaticColumnMapping tests automatic column mapping when no columns are specified.
+func TestParquetAutomaticColumnMapping(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Create a mock table descriptor with columns matching the Parquet schema
+	tableDesc := tabledesc.NewBuilder(&descpb.TableDescriptor{
+		Name: "test_table",
+		Columns: []descpb.ColumnDescriptor{
+			{Name: "id", ID: 1, Type: types.Int, Nullable: false},
+			{Name: "name", ID: 2, Type: types.String, Nullable: true},
+			{Name: "score", ID: 3, Type: types.Float, Nullable: true},
+			{Name: "active", ID: 4, Type: types.Bool, Nullable: true},
+		},
+		NextColumnID: 5,
+		Families: []descpb.ColumnFamilyDescriptor{
+			{
+				Name:        "primary",
+				ColumnNames: []string{"id", "name", "score", "active"},
+				ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4},
+			},
+		},
+		PrimaryIndex: descpb.IndexDescriptor{
+			Name:                "primary",
+			ID:                  1,
+			Unique:              true,
+			KeyColumnNames:      []string{"id"},
+			KeyColumnIDs:        []descpb.ColumnID{1},
+			KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+		},
+	}).BuildImmutableTable()
+
+	// Create import context with NO target columns (automatic mapping)
+	importCtx := &parallelImportContext{
+		targetCols: tree.NameList{}, // Empty - should use all visible columns
+		tableDesc:  tableDesc,
+	}
+
+	// Create a mock Parquet file to get the schema
+	parquetData := createTestParquetFile(t, 1, compress.Codecs.Uncompressed)
+	reader := bytes.NewReader(parquetData.Bytes())
+	fileReader := &fileReader{
+		Reader:   reader,
+		ReaderAt: reader,
+		Seeker:   reader,
+		total:    int64(parquetData.Len()),
+	}
+	producer, err := newParquetRowProducer(fileReader)
+	require.NoError(t, err)
+
+	consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, false)
+	require.NoError(t, err)
+	require.NotNil(t, consumer)
+
+	// Verify field mapping was created automatically for all visible columns
+	require.Equal(t, 4, len(consumer.fieldNameToIdx))
+	require.Contains(t, consumer.fieldNameToIdx, "id")
+	require.Contains(t, consumer.fieldNameToIdx, "name")
+	require.Contains(t, consumer.fieldNameToIdx, "score")
+	require.Contains(t, consumer.fieldNameToIdx, "active")
+
+	// Verify the mapping indices are correct
+	require.Equal(t, 0, consumer.fieldNameToIdx["id"])
+	require.Equal(t, 1, consumer.fieldNameToIdx["name"])
+	require.Equal(t, 2, consumer.fieldNameToIdx["score"])
+	require.Equal(t, 3, consumer.fieldNameToIdx["active"])
+}
+
+// TestParquetMissingRequiredColumn tests that validation fails when a required column is missing.
+func TestParquetMissingRequiredColumn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Create a mock table descriptor with a required column not in the Parquet file
+	tableDesc := tabledesc.NewBuilder(&descpb.TableDescriptor{
+		Name: "test_table",
+		Columns: []descpb.ColumnDescriptor{
+			{Name: "id", ID: 1, Type: types.Int, Nullable: false},
+			{Name: "name", ID: 2, Type: types.String, Nullable: true},
+			{Name: "email", ID: 3, Type: types.String, Nullable: false}, // Required but not in Parquet
+			{Name: "score", ID: 4, Type: types.Float, Nullable: true},
+		},
+		NextColumnID: 5,
+		Families: []descpb.ColumnFamilyDescriptor{
+			{
+				Name:        "primary",
+				ColumnNames: []string{"id", "name", "email", "score"},
+				ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4},
+			},
+		},
+		PrimaryIndex: descpb.IndexDescriptor{
+			Name:                "primary",
+			ID:                  1,
+			Unique:              true,
+			KeyColumnNames:      []string{"id"},
+			KeyColumnIDs:        []descpb.ColumnID{1},
+			KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+		},
+	}).BuildImmutableTable()
+
+	// Create import context with automatic mapping
+	importCtx := &parallelImportContext{
+		targetCols: tree.NameList{}, // Empty - should use all visible columns
+		tableDesc:  tableDesc,
+	}
+
+	// Create a mock Parquet file (has id, name, score, active - but NOT email)
+	parquetData := createTestParquetFile(t, 1, compress.Codecs.Uncompressed)
+	reader := bytes.NewReader(parquetData.Bytes())
+	fileReader := &fileReader{
+		Reader:   reader,
+		ReaderAt: reader,
+		Seeker:   reader,
+		total:    int64(parquetData.Len()),
+	}
+	producer, err := newParquetRowProducer(fileReader)
+	require.NoError(t, err)
+
+	// Should fail because "email" is required (non-nullable, no default) but missing from Parquet
+	consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, false)
+	require.Error(t, err)
+	require.Nil(t, consumer)
+	require.Contains(t, err.Error(), "email")
+	require.Contains(t, err.Error(), "non-nullable, no default")
 }
 
 // TestParquetMultipleFloat64Columns tests that multiple float64 columns
@@ -815,6 +944,135 @@ func TestParquetMultipleFloat64ColumnsLargeFile(t *testing.T) {
 
 	require.NoError(t, producer.Err())
 	require.Equal(t, int64(250), rowNum)
+}
+
+// TestParquetStrictValidation tests strict_validation mode for Parquet imports.
+func TestParquetStrictValidation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	pool := memory.NewGoAllocator()
+
+	// Create Parquet file with extra column not in table
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+			{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+			{Name: "extra_column", Type: arrow.BinaryTypes.String, Nullable: true}, // Extra column
+		},
+		nil,
+	)
+
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	idBuilder := builder.Field(0).(*array.Int32Builder)
+	nameBuilder := builder.Field(1).(*array.StringBuilder)
+	extraBuilder := builder.Field(2).(*array.StringBuilder)
+
+	// Add test data
+	idBuilder.Append(1)
+	nameBuilder.Append("test")
+	extraBuilder.Append("extra_value")
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// Write to Parquet format
+	buf := new(bytes.Buffer)
+	writerProps := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Uncompressed))
+	writer, err := pqarrow.NewFileWriter(schema, buf, writerProps, pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+
+	err = writer.Write(record)
+	require.NoError(t, err)
+
+	err = writer.Close()
+	require.NoError(t, err)
+
+	// Create table with only id and name columns (missing extra_column)
+	tableDesc := tabledesc.NewBuilder(&descpb.TableDescriptor{
+		Name: "test_table",
+		Columns: []descpb.ColumnDescriptor{
+			{Name: "id", ID: 1, Type: types.Int, Nullable: false},
+			{Name: "name", ID: 2, Type: types.String, Nullable: true},
+		},
+		NextColumnID: 3,
+		Families: []descpb.ColumnFamilyDescriptor{
+			{
+				Name:        "primary",
+				ColumnNames: []string{"id", "name"},
+				ColumnIDs:   []descpb.ColumnID{1, 2},
+			},
+		},
+		PrimaryIndex: descpb.IndexDescriptor{
+			Name:                "primary",
+			ID:                  1,
+			Unique:              true,
+			KeyColumnNames:      []string{"id"},
+			KeyColumnIDs:        []descpb.ColumnID{1},
+			KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+		},
+	}).BuildImmutableTable()
+
+	// Test 1: Non-strict mode (default) - should succeed and skip extra_column
+	t.Run("NonStrict", func(t *testing.T) {
+		importCtx := &parallelImportContext{
+			targetCols: tree.NameList{}, // Empty - should use all visible columns
+			tableDesc:  tableDesc,
+		}
+
+		reader := bytes.NewReader(buf.Bytes())
+		fileReader := &fileReader{
+			Reader:   reader,
+			ReaderAt: reader,
+			Seeker:   reader,
+			total:    int64(buf.Len()),
+		}
+		producer, err := newParquetRowProducer(fileReader)
+		require.NoError(t, err)
+
+		consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, false)
+		require.NoError(t, err)
+		require.NotNil(t, consumer)
+		require.False(t, consumer.strict)
+
+		// Verify field mapping - extra_column should not be in mapping
+		require.Equal(t, 2, len(consumer.fieldNameToIdx))
+		require.Contains(t, consumer.fieldNameToIdx, "id")
+		require.Contains(t, consumer.fieldNameToIdx, "name")
+		require.NotContains(t, consumer.fieldNameToIdx, "extra_column")
+	})
+
+	// Test 2: Strict mode - should have strict flag set
+	t.Run("StrictFlagSet", func(t *testing.T) {
+		importCtx := &parallelImportContext{
+			targetCols: tree.NameList{},
+			tableDesc:  tableDesc,
+		}
+
+		reader := bytes.NewReader(buf.Bytes())
+		fileReader := &fileReader{
+			Reader:   reader,
+			ReaderAt: reader,
+			Seeker:   reader,
+			total:    int64(buf.Len()),
+		}
+		producer, err := newParquetRowProducer(fileReader)
+		require.NoError(t, err)
+
+		consumer, err := newParquetRowConsumer(importCtx, producer, &importFileContext{}, true)
+		require.NoError(t, err)
+
+		// Verify strict mode is enabled
+		require.True(t, consumer.strict)
+
+		// Verify field mapping still doesn't include extra_column (same as non-strict)
+		require.Equal(t, 2, len(consumer.fieldNameToIdx))
+		require.Contains(t, consumer.fieldNameToIdx, "id")
+		require.Contains(t, consumer.fieldNameToIdx, "name")
+		require.NotContains(t, consumer.fieldNameToIdx, "extra_column")
+	})
 }
 
 // TestParquetReadTitanicFile reads the Titanic Parquet file from testdata
