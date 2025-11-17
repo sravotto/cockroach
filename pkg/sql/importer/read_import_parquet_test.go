@@ -7,6 +7,7 @@ package importer
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -32,6 +33,51 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+// viewToRow is a test helper that extracts values from a parquetRowView into []interface{}.
+// This allows tests to continue using the simple []interface{} format.
+func viewToRow(rowData interface{}) []interface{} {
+	view, ok := rowData.(*parquetRowView)
+	if !ok {
+		panic(fmt.Sprintf("expected *parquetRowView, got %T", rowData))
+	}
+
+	rowIdx := view.rowIndex
+	row := make([]interface{}, view.numColumns)
+
+	for colIdx := 0; colIdx < view.numColumns; colIdx++ {
+		batch := view.batches[colIdx]
+		if batch == nil {
+			row[colIdx] = nil
+			continue
+		}
+
+		if batch.isNull[rowIdx] {
+			row[colIdx] = nil
+			continue
+		}
+
+		// Extract typed value
+		switch batch.physicalType {
+		case parquet.Types.Boolean:
+			row[colIdx] = batch.boolValues[rowIdx]
+		case parquet.Types.Int32:
+			row[colIdx] = batch.int32Values[rowIdx]
+		case parquet.Types.Int64:
+			row[colIdx] = batch.int64Values[rowIdx]
+		case parquet.Types.Float:
+			row[colIdx] = batch.float32Values[rowIdx]
+		case parquet.Types.Double:
+			row[colIdx] = batch.float64Values[rowIdx]
+		case parquet.Types.ByteArray:
+			row[colIdx] = batch.byteArrayValues[rowIdx]
+		case parquet.Types.FixedLenByteArray:
+			row[colIdx] = batch.fixedLenByteArrayValues[rowIdx]
+		}
+	}
+
+	return row
+}
 
 // TestConvertParquetValueToDatum tests the type conversion function
 func TestConvertParquetValueToDatum(t *testing.T) {
@@ -424,7 +470,7 @@ func TestParquetRowProducerBasicScanning(t *testing.T) {
 				require.NoError(t, err)
 				require.NotNil(t, row)
 
-				rowData := row.([]interface{})
+				rowData := viewToRow(row)
 				require.Equal(t, 4, len(rowData))
 
 				// Verify ID column (always present)
@@ -463,7 +509,7 @@ func TestParquetRowProducerNullHandling(t *testing.T) {
 		row, err := producer.Row()
 		require.NoError(t, err)
 
-		rowData := row.([]interface{})
+		rowData := viewToRow(row)
 
 		// Check NULL values based on test data pattern
 		// name is NULL when rowCount % 3 == 0
@@ -516,7 +562,7 @@ func TestParquetRowProducerBatching(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, row)
 
-		rowData := row.([]interface{})
+		rowData := viewToRow(row)
 		require.Equal(t, int32(rowCount), rowData[0])
 
 		rowCount++
@@ -624,7 +670,7 @@ func TestParquetRowProducerSkip(t *testing.T) {
 	row, err := producer.Row()
 	require.NoError(t, err)
 
-	rowData := row.([]interface{})
+	rowData := viewToRow(row)
 	require.Equal(t, int32(1), rowData[0])
 }
 
@@ -859,7 +905,7 @@ func TestParquetMultipleFloat64Columns(t *testing.T) {
 		row, err := producer.Row()
 		require.NoError(t, err)
 
-		rowData := row.([]interface{})
+		rowData := viewToRow(row)
 		require.Equal(t, 3, len(rowData))
 
 		if rowNum == 0 {
@@ -943,7 +989,7 @@ func TestParquetMultipleFloat64ColumnsLargeFile(t *testing.T) {
 		row, err := producer.Row()
 		require.NoError(t, err)
 
-		rowData := row.([]interface{})
+		rowData := viewToRow(row)
 		expectedAge := float64(20 + rowNum)
 		expectedFare := 10.0 + float64(rowNum)*0.5
 
@@ -1138,7 +1184,7 @@ func TestParquetReadTitanicFile(t *testing.T) {
 		row, err := producer.Row()
 		require.NoError(t, err)
 
-		rowData := row.([]interface{})
+		rowData := viewToRow(row)
 
 		// Keep only last 5 rows
 		if len(lastRows) >= 5 {
