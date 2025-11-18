@@ -35,6 +35,10 @@ type parquetColumnBatch struct {
 	physicalType parquet.Type
 	rowCount     int64 // Number of rows in this batch
 
+	// Cached metadata to avoid repeated schema lookups in hot path
+	logicalType   schema.LogicalType
+	convertedType schema.ConvertedType
+
 	// Only one of these slices will be populated, based on physicalType.
 	// All slices have length rowCount (expanded to include nulls).
 	boolValues              []bool
@@ -60,6 +64,13 @@ type parquetRowView struct {
 	rowIndex   int64                 // Index within the batches
 }
 
+// parquetColumnMetadata caches immutable schema information for a column.
+// This is populated once when the file is opened and reused across all batches.
+type parquetColumnMetadata struct {
+	logicalType   schema.LogicalType
+	convertedType schema.ConvertedType
+}
+
 // parquetRowProducer implements importRowProducer for Parquet files.
 // It reads columnar data in batches and provides row-oriented access via views.
 type parquetRowProducer struct {
@@ -75,6 +86,9 @@ type parquetRowProducer struct {
 	columnsToRead []int                          // Parquet column indices to read
 	numColumns    int                            // Total number of columns in Parquet file
 	columnReaders map[int]file.ColumnChunkReader // Maps Parquet column index -> reader
+
+	// Cached schema metadata (populated once per file, used for all batches)
+	columnMetadata map[int]*parquetColumnMetadata // Maps Parquet column index -> metadata
 
 	// Batching configuration
 	batchSize int64 // Number of rows to read in a single batch
@@ -234,12 +248,25 @@ func newParquetRowProducer(input *fileReader, importCtx *parallelImportContext) 
 		columnsToRead = determineColumnsToRead(importCtx, parquetSchema)
 	}
 
+	// Cache schema metadata once per file for all columns we'll read
+	// This avoids repeated schema lookups in the hot path (readBatchFromColumn)
+	columnMetadata := make(map[int]*parquetColumnMetadata)
+	parquetSchema := reader.MetaData().Schema
+	for _, colIdx := range columnsToRead {
+		col := parquetSchema.Column(colIdx)
+		columnMetadata[colIdx] = &parquetColumnMetadata{
+			logicalType:   col.LogicalType(),
+			convertedType: col.ConvertedType(),
+		}
+	}
+
 	return &parquetRowProducer{
 		reader:          reader,
 		currentRowGroup: -1, // Start at -1 so first advance goes to 0
 		totalRowGroups:  totalRowGroups,
 		columnsToRead:   columnsToRead,
 		numColumns:      numColumns,
+		columnMetadata:  columnMetadata,
 		totalRows:       totalRows,
 		rowsProcessed:   0,
 		batchSize:       batchSize,
@@ -352,7 +379,7 @@ func (p *parquetRowProducer) fillBuffer() error {
 		colReader := p.columnReaders[colIdx]
 
 		// Read a batch of typed values from this column
-		batch, err := p.readBatchFromColumn(colReader, rowsToRead)
+		batch, err := p.readBatchFromColumn(colReader, colIdx, rowsToRead)
 		if err != nil {
 			return errors.Wrapf(err, "failed to read batch from column %d", colIdx)
 		}
@@ -407,14 +434,21 @@ func (p *parquetRowProducer) Row() (interface{}, error) {
 // Returns a parquetColumnBatch with typed values, avoiding boxing into interface{}.
 func (p *parquetRowProducer) readBatchFromColumn(
 	colReader file.ColumnChunkReader,
+	colIdx int,
 	rowsToRead int64,
 ) (*parquetColumnBatch, error) {
-	maxDefLevel := colReader.Descriptor().MaxDefinitionLevel()
+	descriptor := colReader.Descriptor()
+	maxDefLevel := descriptor.MaxDefinitionLevel()
+
+	// Use cached metadata from file-level schema lookup instead of per-batch descriptor calls
+	metadata := p.columnMetadata[colIdx]
 
 	batch := &parquetColumnBatch{
-		physicalType: colReader.Type(),
-		rowCount:     rowsToRead,
-		isNull:       make([]bool, rowsToRead),
+		physicalType:  colReader.Type(),
+		rowCount:      rowsToRead,
+		logicalType:   metadata.logicalType,
+		convertedType: metadata.convertedType,
+		isNull:        make([]bool, rowsToRead),
 	}
 
 	// Helper to expand compacted values into full array with null markers.
@@ -799,7 +833,8 @@ func (c *parquetRowConsumer) FillDatums(
 			// Convert Parquet value to datum based on target column type
 			targetType := conv.VisibleColTypes[tableColIdx]
 			var err error
-			datum, err = convertParquetValueToDatum(value, targetType, col.LogicalType(), col.ConvertedType())
+			// Use cached logical/converted types from batch to avoid schema lookups
+			datum, err = convertParquetValueToDatum(value, targetType, batch.logicalType, batch.convertedType)
 			if err != nil {
 				return newImportRowError(err, fmt.Sprintf("row %d", rowNum), rowNum)
 			}
