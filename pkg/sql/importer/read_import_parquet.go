@@ -197,6 +197,11 @@ const defaultParquetBatchSize = 100
 // newParquetRowProducer creates a new Parquet row producer from a fileReader.
 // It opens the Parquet file and determines which columns to read based on importCtx.
 // If importCtx is nil, all columns are read (useful for tests).
+//
+// Thread Safety Note:
+// Apache Arrow's Parquet reader uses ReadAt to read column chunks, potentially from
+// multiple goroutines. This is safe because fileReader's underlying ResumingReader
+// supports concurrent ReadAt calls. See fileReader's documentation for details.
 func newParquetRowProducer(input *fileReader, importCtx *parallelImportContext) (*parquetRowProducer, error) {
 
 	// Open Parquet file

@@ -498,6 +498,18 @@ func (b *byteCounter) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// fileReader wraps cloud storage readers to provide io.Reader, io.ReaderAt, and io.Seeker
+// interfaces along with progress tracking.
+//
+// Thread Safety:
+// The underlying cloud.ResumingReader provides different thread safety guarantees for different methods:
+// - ReadAt: Safe for concurrent calls. Multiple goroutines can call ReadAt simultaneously.
+//   This is used by formats like Parquet that read different file sections in parallel.
+// - Read/Seek: NOT safe for concurrent calls. Should only be used from a single goroutine.
+//
+// Usage patterns:
+// - Sequential formats (CSV, Avro, etc.): Single goroutine uses Read/Seek
+// - Random-access formats (Parquet): Multiple goroutines use ReadAt; Seek only during initialization
 type fileReader struct {
 	io.Reader
 	io.ReaderAt
