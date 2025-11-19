@@ -29,15 +29,33 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// parquetReadBatchFunc reads a batch of values from a Parquet column reader.
+// Returns (numRowsRead, numValuesRead, error).
+// numRowsRead includes NULLs, numValuesRead excludes NULLs.
+type parquetReadBatchFunc func() (numRowsRead int64, numValuesRead int, err error)
+
+// parquetCopyValueFunc copies a single value from the read buffer to the batch.
+// rowIdx is the destination index in the batch (including NULLs).
+// valIdx is the source index in the read buffer (excluding NULLs).
+type parquetCopyValueFunc func(rowIdx int, valIdx int)
+
 // parquetColumnBatch stores a batch of values for a single column in typed form.
 // This avoids boxing values into interface{} until absolutely necessary.
 type parquetColumnBatch struct {
 	physicalType parquet.Type
 	rowCount     int64 // Number of rows in this batch
+	maxDefLevel  int16 // Maximum definition level for this column (for NULL handling)
 
 	// Reference to the column's metadata (cached at file-open time).
 	// This includes the conversion function determined once per column.
 	metadata *parquetColumnMetadata
+
+	// Definition levels for this batch - determines which rows are NULL
+	defLevels []int16
+
+	// Functions for reading and copying values (set up in constructor)
+	readBatch parquetReadBatchFunc
+	copyValue parquetCopyValueFunc
 
 	// Only one of these slices will be populated, based on physicalType.
 	// All slices have length rowCount (expanded to include nulls).
@@ -51,6 +69,129 @@ type parquetColumnBatch struct {
 
 	// Null tracking - one entry per row
 	isNull []bool // [rowIdx] -> is this row null?
+}
+
+// newParquetColumnBatch creates a new column batch with allocated buffers and
+// configured reader/copier functions based on the physical type.
+func newParquetColumnBatch(
+	colReader file.ColumnChunkReader,
+	p *parquetRowProducer,
+	rowCount int64,
+	metadata *parquetColumnMetadata,
+) *parquetColumnBatch {
+	descriptor := colReader.Descriptor()
+	maxDefLevel := descriptor.MaxDefinitionLevel()
+	physicalType := colReader.Type()
+
+	b := &parquetColumnBatch{
+		physicalType: physicalType,
+		rowCount:     rowCount,
+		maxDefLevel:  maxDefLevel,
+		metadata:     metadata,
+		defLevels:    make([]int16, rowCount),
+		isNull:       make([]bool, rowCount),
+	}
+
+	// Set up typed buffer and reader/copier functions based on physical type
+	switch physicalType {
+	case parquet.Types.Boolean:
+		b.boolValues = make([]bool, rowCount)
+		b.readBatch = func() (int64, int, error) {
+			return colReader.(*file.BooleanColumnChunkReader).ReadBatch(rowCount, p.boolBuf, b.defLevels, p.repLevels)
+		}
+		b.copyValue = func(rowIdx, valIdx int) {
+			b.boolValues[rowIdx] = p.boolBuf[valIdx]
+		}
+
+	case parquet.Types.Int32:
+		b.int32Values = make([]int32, rowCount)
+		b.readBatch = func() (int64, int, error) {
+			return colReader.(*file.Int32ColumnChunkReader).ReadBatch(rowCount, p.int32Buf, b.defLevels, p.repLevels)
+		}
+		b.copyValue = func(rowIdx, valIdx int) {
+			b.int32Values[rowIdx] = p.int32Buf[valIdx]
+		}
+
+	case parquet.Types.Int64:
+		b.int64Values = make([]int64, rowCount)
+		b.readBatch = func() (int64, int, error) {
+			return colReader.(*file.Int64ColumnChunkReader).ReadBatch(rowCount, p.int64Buf, b.defLevels, p.repLevels)
+		}
+		b.copyValue = func(rowIdx, valIdx int) {
+			b.int64Values[rowIdx] = p.int64Buf[valIdx]
+		}
+
+	case parquet.Types.Float:
+		b.float32Values = make([]float32, rowCount)
+		b.readBatch = func() (int64, int, error) {
+			return colReader.(*file.Float32ColumnChunkReader).ReadBatch(rowCount, p.float32Buf, b.defLevels, p.repLevels)
+		}
+		b.copyValue = func(rowIdx, valIdx int) {
+			b.float32Values[rowIdx] = p.float32Buf[valIdx]
+		}
+
+	case parquet.Types.Double:
+		b.float64Values = make([]float64, rowCount)
+		b.readBatch = func() (int64, int, error) {
+			return colReader.(*file.Float64ColumnChunkReader).ReadBatch(rowCount, p.float64Buf, b.defLevels, p.repLevels)
+		}
+		b.copyValue = func(rowIdx, valIdx int) {
+			b.float64Values[rowIdx] = p.float64Buf[valIdx]
+		}
+
+	case parquet.Types.ByteArray:
+		byteArrayBuf := make([]parquet.ByteArray, rowCount)
+		b.byteArrayValues = make([][]byte, rowCount)
+		b.readBatch = func() (int64, int, error) {
+			return colReader.(*file.ByteArrayColumnChunkReader).ReadBatch(rowCount, byteArrayBuf, b.defLevels, p.repLevels)
+		}
+		b.copyValue = func(rowIdx, valIdx int) {
+			// Copy bytes since the buffer may be reused
+			copied := make([]byte, len(byteArrayBuf[valIdx]))
+			copy(copied, byteArrayBuf[valIdx])
+			b.byteArrayValues[rowIdx] = copied
+		}
+
+	case parquet.Types.FixedLenByteArray:
+		fixedBuf := make([]parquet.FixedLenByteArray, rowCount)
+		b.fixedLenByteArrayValues = make([]parquet.FixedLenByteArray, rowCount)
+		b.readBatch = func() (int64, int, error) {
+			return colReader.(*file.FixedLenByteArrayColumnChunkReader).ReadBatch(rowCount, fixedBuf, b.defLevels, p.repLevels)
+		}
+		b.copyValue = func(rowIdx, valIdx int) {
+			b.fixedLenByteArrayValues[rowIdx] = fixedBuf[valIdx]
+		}
+	}
+
+	return b
+}
+
+// Read populates the batch by reading from the Parquet column reader.
+// It expands compacted values into full array with null markers.
+// For nullable columns, valuesRead < numRead because NULLs don't have values in the buffer.
+// The reader and copier functions are already configured in the constructor.
+func (b *parquetColumnBatch) Read() error {
+	numRead, valuesRead, err := b.readBatch()
+	if err != nil {
+		return err
+	}
+	if numRead != b.rowCount {
+		return errors.Newf("expected %d rows, got %d", b.rowCount, numRead)
+	}
+	valIdx := 0
+	for i := int64(0); i < numRead; i++ {
+		if b.maxDefLevel > 0 && b.defLevels[i] < b.maxDefLevel {
+			b.isNull[i] = true
+		} else {
+			if valIdx >= valuesRead {
+				return errors.Newf("values index %d exceeds valuesRead %d", valIdx, valuesRead)
+			}
+			b.isNull[i] = false
+			b.copyValue(int(i), valIdx)
+			valIdx++
+		}
+	}
+	return nil
 }
 
 // parquetRowView is a lightweight view into a row of columnar data.
@@ -445,141 +586,15 @@ func (p *parquetRowProducer) readBatchFromColumn(
 	colIdx int,
 	rowsToRead int64,
 ) (*parquetColumnBatch, error) {
-	descriptor := colReader.Descriptor()
-	maxDefLevel := descriptor.MaxDefinitionLevel()
-
-	// Use cached metadata from file-level schema lookup instead of per-batch descriptor calls
+	// Use cached metadata from file-level schema lookup
 	metadata := p.columnMetadata[colIdx]
 
-	batch := &parquetColumnBatch{
-		physicalType: colReader.Type(),
-		rowCount:     rowsToRead,
-		metadata:     metadata,
-		isNull:       make([]bool, rowsToRead),
-	}
+	// Create batch with all setup done in constructor
+	batch := newParquetColumnBatch(colReader, p, rowsToRead, metadata)
 
-	// Helper to expand compacted values into full array with null markers.
-	// For nullable columns, valuesRead < numRead because NULLs don't have values in the buffer.
-	expandValues := func(numRead int64, valuesRead int, defLevels []int16, copyValue func(rowIdx int, valIdx int)) error {
-		if numRead != rowsToRead {
-			return errors.Newf("expected %d rows, got %d", rowsToRead, numRead)
-		}
-		valIdx := 0
-		for i := int64(0); i < numRead; i++ {
-			if maxDefLevel > 0 && defLevels[i] < maxDefLevel {
-				batch.isNull[i] = true
-			} else {
-				if valIdx >= valuesRead {
-					return errors.Newf("values index %d exceeds valuesRead %d", valIdx, valuesRead)
-				}
-				batch.isNull[i] = false
-				copyValue(int(i), valIdx)
-				valIdx++
-			}
-		}
-		return nil
-	}
-
-	// Determine the physical type and use the appropriate typed reader
-	switch colReader.Type() {
-	case parquet.Types.Boolean:
-		reader := colReader.(*file.BooleanColumnChunkReader)
-		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.boolBuf, p.defLevels, p.repLevels)
-		if err != nil {
-			return nil, err
-		}
-		batch.boolValues = make([]bool, rowsToRead)
-		if err := expandValues(numRead, valuesRead, p.defLevels, func(rowIdx, valIdx int) {
-			batch.boolValues[rowIdx] = p.boolBuf[valIdx]
-		}); err != nil {
-			return nil, err
-		}
-
-	case parquet.Types.Int32:
-		reader := colReader.(*file.Int32ColumnChunkReader)
-		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.int32Buf, p.defLevels, p.repLevels)
-		if err != nil {
-			return nil, err
-		}
-		batch.int32Values = make([]int32, rowsToRead)
-		if err := expandValues(numRead, valuesRead, p.defLevels, func(rowIdx, valIdx int) {
-			batch.int32Values[rowIdx] = p.int32Buf[valIdx]
-		}); err != nil {
-			return nil, err
-		}
-
-	case parquet.Types.Int64:
-		reader := colReader.(*file.Int64ColumnChunkReader)
-		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.int64Buf, p.defLevels, p.repLevels)
-		if err != nil {
-			return nil, err
-		}
-		batch.int64Values = make([]int64, rowsToRead)
-		if err := expandValues(numRead, valuesRead, p.defLevels, func(rowIdx, valIdx int) {
-			batch.int64Values[rowIdx] = p.int64Buf[valIdx]
-		}); err != nil {
-			return nil, err
-		}
-
-	case parquet.Types.Float:
-		reader := colReader.(*file.Float32ColumnChunkReader)
-		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.float32Buf, p.defLevels, p.repLevels)
-		if err != nil {
-			return nil, err
-		}
-		batch.float32Values = make([]float32, rowsToRead)
-		if err := expandValues(numRead, valuesRead, p.defLevels, func(rowIdx, valIdx int) {
-			batch.float32Values[rowIdx] = p.float32Buf[valIdx]
-		}); err != nil {
-			return nil, err
-		}
-
-	case parquet.Types.Double:
-		reader := colReader.(*file.Float64ColumnChunkReader)
-		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, p.float64Buf, p.defLevels, p.repLevels)
-		if err != nil {
-			return nil, err
-		}
-		batch.float64Values = make([]float64, rowsToRead)
-		if err := expandValues(numRead, valuesRead, p.defLevels, func(rowIdx, valIdx int) {
-			batch.float64Values[rowIdx] = p.float64Buf[valIdx]
-		}); err != nil {
-			return nil, err
-		}
-
-	case parquet.Types.ByteArray:
-		reader := colReader.(*file.ByteArrayColumnChunkReader)
-		byteArrayBuf := make([]parquet.ByteArray, rowsToRead)
-		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, byteArrayBuf, p.defLevels, p.repLevels)
-		if err != nil {
-			return nil, err
-		}
-		batch.byteArrayValues = make([][]byte, rowsToRead)
-		if err := expandValues(numRead, valuesRead, p.defLevels, func(rowIdx, valIdx int) {
-			// Copy bytes since the buffer may be reused
-			copied := make([]byte, len(byteArrayBuf[valIdx]))
-			copy(copied, byteArrayBuf[valIdx])
-			batch.byteArrayValues[rowIdx] = copied
-		}); err != nil {
-			return nil, err
-		}
-
-	case parquet.Types.FixedLenByteArray:
-		reader := colReader.(*file.FixedLenByteArrayColumnChunkReader)
-		fixedBuf := make([]parquet.FixedLenByteArray, rowsToRead)
-		numRead, valuesRead, err := reader.ReadBatch(rowsToRead, fixedBuf, p.defLevels, p.repLevels)
-		if err != nil {
-			return nil, err
-		}
-		batch.fixedLenByteArrayValues = make([]parquet.FixedLenByteArray, rowsToRead)
-		if err := expandValues(numRead, valuesRead, p.defLevels, func(rowIdx, valIdx int) {
-			batch.fixedLenByteArrayValues[rowIdx] = fixedBuf[valIdx]
-		}); err != nil {
-			return nil, err
-		}
-
-	default:
-		return nil, errors.Errorf("unsupported Parquet type: %v", colReader.Type())
+	// Read and populate the batch
+	if err := batch.Read(); err != nil {
+		return nil, err
 	}
 
 	return batch, nil
