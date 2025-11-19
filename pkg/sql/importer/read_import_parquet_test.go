@@ -336,7 +336,19 @@ func TestConvertParquetValueToDatum(t *testing.T) {
 			if tc.logicalType == nil && tc.convertedType == 0 {
 				convertedType = schema.ConvertedTypes.None
 			}
-			result, err := convertParquetValueToDatum(tc.value, tc.targetType, logicalType, convertedType)
+			// Create metadata and determine which converter to use
+			metadata := &parquetColumnMetadata{
+				logicalType:   logicalType,
+				convertedType: convertedType,
+			}
+			// Use LogicalType converter if available, otherwise ConvertedType
+			var converter parquetConversionFunc
+			if logicalType != nil {
+				converter = convertWithLogicalType
+			} else {
+				converter = convertWithConvertedType
+			}
+			result, err := converter(tc.value, tc.targetType, metadata)
 			if tc.expectErr {
 				require.Error(t, err)
 				return
