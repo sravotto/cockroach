@@ -912,12 +912,15 @@ func convertWithLogicalType(
 }
 
 // determineConverter selects the appropriate conversion function based on what type
-// annotations are available in the Parquet file. Modern files use LogicalType.
-// Legacy ConvertedType support will be available in read_import_parquet_legacy.go.
+// annotations are available in the Parquet file. Modern files use LogicalType,
+// while older files use ConvertedType for backward compatibility.
 func determineConverter(col *schema.Column) parquetConversionFunc {
-	// For now, only support modern LogicalType
-	// If LogicalType is not present, we'll error during conversion
-	return convertWithLogicalType
+	// Prefer LogicalType (modern annotation system) if available
+	if col.LogicalType() != nil {
+		return convertWithLogicalType
+	}
+	// Fall back to ConvertedType (legacy annotation system)
+	return convertWithConvertedType
 }
 
 // validateWithLogicalType validates type compatibility using modern LogicalType annotations.
@@ -933,16 +936,6 @@ func validateWithLogicalType(
 		}
 
 	case parquet.Types.Int32:
-		// Check if target type requires a LogicalType that's missing
-		if logicalType == nil {
-			if targetType.Family() == types.DateFamily {
-				return errors.Newf("DATE target requires Parquet DateLogicalType (legacy ConvertedType not yet supported)")
-			}
-			if targetType.Family() == types.TimeFamily {
-				return errors.Newf("TIME target requires Parquet TimeLogicalType (legacy ConvertedType not yet supported)")
-			}
-		}
-
 		// Check for special logical types first
 		if logicalType != nil {
 			if _, ok := logicalType.(schema.DateLogicalType); ok {
@@ -973,16 +966,6 @@ func validateWithLogicalType(
 		}
 
 	case parquet.Types.Int64:
-		// Check if target type requires a LogicalType that's missing
-		if logicalType == nil {
-			if targetType.Family() == types.TimestampFamily || targetType.Family() == types.TimestampTZFamily {
-				return errors.Newf("TIMESTAMP target requires Parquet TimestampLogicalType (legacy ConvertedType not yet supported)")
-			}
-			if targetType.Family() == types.TimeFamily {
-				return errors.Newf("TIME target requires Parquet TimeLogicalType (legacy ConvertedType not yet supported)")
-			}
-		}
-
 		// Check for special logical types
 		if logicalType != nil {
 			if _, ok := logicalType.(*schema.TimestampLogicalType); ok {
@@ -1079,11 +1062,17 @@ func validateWithLogicalType(
 }
 
 // validateParquetTypeCompatibility checks if a Parquet column can be converted to a target CockroachDB type.
-// Uses LogicalType for modern Parquet files. Legacy ConvertedType support is in read_import_parquet_legacy.go.
+// Uses LogicalType for modern Parquet files, or ConvertedType for legacy files.
 func validateParquetTypeCompatibility(parquetCol *schema.Column, targetType *types.T) error {
 	physicalType := parquetCol.PhysicalType()
 	logicalType := parquetCol.LogicalType()
+	convertedType := parquetCol.ConvertedType()
 
-	// Use LogicalType (modern annotation system)
-	return validateWithLogicalType(physicalType, logicalType, targetType)
+	// Prefer LogicalType (modern annotation system) if available
+	if logicalType != nil {
+		return validateWithLogicalType(physicalType, logicalType, targetType)
+	}
+
+	// Fall back to ConvertedType (legacy annotation system)
+	return validateWithConvertedType(physicalType, convertedType, targetType)
 }
