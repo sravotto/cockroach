@@ -145,6 +145,66 @@ func runImport(
 	}
 }
 
+// closerFunc is a helper type that allows a function to implement io.Closer.
+type closerFunc func() error
+
+func (f closerFunc) Close() error {
+	return f()
+}
+
+// makeFileReader creates a fileReader for the given format, applying
+// decompression for formats that need it (CSV, Avro, etc.) or providing
+// seekable access for formats that require it (Parquet).
+func makeFileReader(
+	ctx context.Context,
+	raw ioctx.ReadCloserCtx,
+	format roachpb.IOFileFormat,
+	fileSize int64,
+	dataFile string,
+) (*fileReader, io.Closer, error) {
+	// Parquet needs seekable, uncompressed access
+	// (compression is handled internally by Parquet)
+	if format.Format == roachpb.IOFileFormat_Parquet {
+		// Use adapter to convert ReadCloserCtx to standard io interfaces for Parquet
+		// The adapter will validate that the reader supports ReadAt and Seek
+		adapted, err := ioctx.ReaderAtSeekerAdapter(ctx, raw)
+		if err != nil {
+			// Reader doesn't support random access - return helpful error message
+			return nil, nil, errors.Wrapf(err,
+				"Parquet import requires storage that supports random access. "+
+					"Use cloud storage URLs (s3://, gs://, azure://) or HTTP servers that support range requests (Accept-Ranges: bytes)")
+		}
+
+		src := &fileReader{
+			Reader:   adapted,
+			ReaderAt: adapted,
+			Seeker:   adapted,
+			total:    fileSize,
+			counter:  byteCounter{r: adapted},
+		}
+		closer := closerFunc(func() error {
+			return adapted.Close()
+		})
+		return src, closer, nil
+
+		// TODO: Consider enabling temp file buffering fallback if needed.
+	}
+
+	// Other formats: apply decompression wrapper
+	src := &fileReader{
+		total:   fileSize,
+		counter: byteCounter{r: ioctx.ReaderCtxAdapter(ctx, raw)},
+	}
+	decompressed, err := decompressingReader(&src.counter, dataFile, format.Compression)
+	if err != nil {
+		return nil, nil, err
+	}
+	src.Reader = decompressed
+
+	// Return decompressed as closer
+	return src, decompressed, nil
+}
+
 // readInputFiles reads each of the passed dataFiles using the passed func. The
 // key part of dataFiles is the unique index of the data file among all files in
 // the IMPORT. progressFn, if not nil, is periodically invoked with a percentage
@@ -236,19 +296,19 @@ func readInputFiles(
 				return err
 			}
 			defer es.Close()
-			raw, _, err := es.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
+			// For Parquet we need the file size; for other formats it's optional but useful
+			raw, fileSize, err := es.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: false})
 			if err != nil {
 				return err
 			}
 			defer raw.Close(ctx)
 
-			src := &fileReader{total: fileSizes[dataFileIndex], counter: byteCounter{r: ioctx.ReaderCtxAdapter(ctx, raw)}}
-			decompressed, err := decompressingReader(&src.counter, dataFile, format.Compression)
+			// Create fileReader with format-specific handling
+			src, closer, err := makeFileReader(ctx, raw, format, fileSize, dataFile)
 			if err != nil {
 				return err
 			}
-			defer decompressed.Close()
-			src.Reader = decompressed
+			defer closer.Close()
 
 			var rejected chan string
 			if (format.Format == roachpb.IOFileFormat_CSV && format.SaveRejected) ||
@@ -373,8 +433,22 @@ func (b *byteCounter) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// fileReader wraps cloud storage readers to provide io.Reader, io.ReaderAt, and io.Seeker
+// interfaces along with progress tracking.
+//
+// Thread Safety:
+// The underlying cloud.ResumingReader provides different thread safety guarantees for different methods:
+//   - ReadAt: Safe for concurrent calls. Multiple goroutines can call ReadAt simultaneously.
+//     This is used by formats like Parquet that read different file sections in parallel.
+//   - Read/Seek: NOT safe for concurrent calls. Should only be used from a single goroutine.
+//
+// Usage patterns:
+// - Sequential formats (CSV, Avro, etc.): Single goroutine uses Read/Seek
+// - Random-access formats (Parquet): Multiple goroutines use ReadAt; Seek only during initialization
 type fileReader struct {
 	io.Reader
+	io.ReaderAt
+	io.Seeker
 	total   int64
 	counter byteCounter
 }
@@ -396,6 +470,8 @@ type inputConverter interface {
 func formatHasNamedColumns(format roachpb.IOFileFormat_FileFormat) bool {
 	switch format {
 	case roachpb.IOFileFormat_Avro:
+		return true
+	case roachpb.IOFileFormat_Parquet:
 		return true
 	}
 	return false

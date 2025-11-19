@@ -7,16 +7,20 @@ package importer
 
 import (
 	"context"
+	"io"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -194,4 +198,181 @@ func TestParallelImportProducerHandlesCancellation(t *testing.T) {
 					&importFileContext{}, &nilDataProducer{}, &nilDataConsumer{}))
 			return nil
 		}))
+}
+
+// mockSeekableReader is a mock that implements ReadCloserCtx, ReaderAtCtx, and SeekerCtx
+// for testing makeFileReader with Parquet format
+type mockSeekableReader struct {
+	data   []byte
+	pos    int64
+	closed bool
+}
+
+func newMockSeekableReader(data string) *mockSeekableReader {
+	return &mockSeekableReader{
+		data: []byte(data),
+	}
+}
+
+func (m *mockSeekableReader) Read(ctx context.Context, p []byte) (int, error) {
+	if m.pos >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.data[m.pos:])
+	m.pos += int64(n)
+	return n, nil
+}
+
+func (m *mockSeekableReader) Close(ctx context.Context) error {
+	m.closed = true
+	return nil
+}
+
+func (m *mockSeekableReader) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
+	if off >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (m *mockSeekableReader) Seek(ctx context.Context, offset int64, whence int) (int64, error) {
+	var newPos int64
+	switch whence {
+	case io.SeekStart:
+		newPos = offset
+	case io.SeekCurrent:
+		newPos = m.pos + offset
+	case io.SeekEnd:
+		newPos = int64(len(m.data)) + offset
+	default:
+		return 0, errors.Newf("invalid whence: %d", whence)
+	}
+
+	if newPos < 0 {
+		return 0, errors.New("negative position")
+	}
+
+	m.pos = newPos
+	return newPos, nil
+}
+
+// mockNonSeekableReader implements ReadCloserCtx but NOT SeekerCtx
+type mockNonSeekableReader struct {
+	data   []byte
+	pos    int64
+	closed bool
+}
+
+func newMockNonSeekableReader(data string) *mockNonSeekableReader {
+	return &mockNonSeekableReader{
+		data: []byte(data),
+	}
+}
+
+func (m *mockNonSeekableReader) Read(ctx context.Context, p []byte) (int, error) {
+	if m.pos >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.data[m.pos:])
+	m.pos += int64(n)
+	return n, nil
+}
+
+func (m *mockNonSeekableReader) Close(ctx context.Context) error {
+	m.closed = true
+	return nil
+}
+
+func TestMakeFileReader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	testData := "test data for file reader"
+
+	t.Run("parquet-with-seekable-reader", func(t *testing.T) {
+		mock := newMockSeekableReader(testData)
+		format := roachpb.IOFileFormat{
+			Format: roachpb.IOFileFormat_Parquet,
+		}
+
+		reader, closer, err := makeFileReader(ctx, mock, format, int64(len(testData)), "test.parquet")
+		require.NoError(t, err)
+		require.NotNil(t, reader)
+		require.NotNil(t, closer)
+
+		// Verify fileReader has all required interfaces
+		require.NotNil(t, reader.Reader)
+		require.NotNil(t, reader.ReaderAt)
+		require.NotNil(t, reader.Seeker)
+		require.Equal(t, int64(len(testData)), reader.total)
+
+		// Clean up
+		err = closer.Close()
+		require.NoError(t, err)
+	})
+
+	t.Run("parquet-with-non-seekable-reader", func(t *testing.T) {
+		mock := newMockNonSeekableReader(testData)
+		format := roachpb.IOFileFormat{
+			Format: roachpb.IOFileFormat_Parquet,
+		}
+
+		reader, closer, err := makeFileReader(ctx, mock, format, int64(len(testData)), "test.parquet")
+		require.Error(t, err)
+		require.Nil(t, reader)
+		require.Nil(t, closer)
+		require.Contains(t, err.Error(), "Parquet import requires storage that supports random access")
+	})
+
+	t.Run("csv-format", func(t *testing.T) {
+		// Use a simple adapter for CSV since it doesn't need seeking
+		mock := ioctx.ReadCloserAdapter(io.NopCloser(strings.NewReader(testData)))
+		format := roachpb.IOFileFormat{
+			Format:      roachpb.IOFileFormat_CSV,
+			Compression: roachpb.IOFileFormat_None,
+		}
+
+		reader, closer, err := makeFileReader(ctx, mock, format, int64(len(testData)), "test.csv")
+		require.NoError(t, err)
+		require.NotNil(t, reader)
+		require.NotNil(t, closer)
+
+		// Verify fileReader for CSV
+		require.NotNil(t, reader.Reader)
+		require.Nil(t, reader.ReaderAt) // CSV doesn't need ReaderAt
+		require.Nil(t, reader.Seeker)   // CSV doesn't need Seeker
+		require.Equal(t, int64(len(testData)), reader.total)
+
+		// Clean up
+		err = closer.Close()
+		require.NoError(t, err)
+	})
+
+	t.Run("avro-format", func(t *testing.T) {
+		mock := ioctx.ReadCloserAdapter(io.NopCloser(strings.NewReader(testData)))
+		format := roachpb.IOFileFormat{
+			Format:      roachpb.IOFileFormat_Avro,
+			Compression: roachpb.IOFileFormat_None,
+		}
+
+		reader, closer, err := makeFileReader(ctx, mock, format, int64(len(testData)), "test.avro")
+		require.NoError(t, err)
+		require.NotNil(t, reader)
+		require.NotNil(t, closer)
+
+		// Verify fileReader for Avro
+		require.NotNil(t, reader.Reader)
+		require.Nil(t, reader.ReaderAt)
+		require.Nil(t, reader.Seeker)
+		require.Equal(t, int64(len(testData)), reader.total)
+
+		// Clean up
+		err = closer.Close()
+		require.NoError(t, err)
+	})
 }
