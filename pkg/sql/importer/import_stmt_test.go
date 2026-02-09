@@ -1780,6 +1780,236 @@ func TestImportCSVStmt(t *testing.T) {
 	}
 }
 
+func setupTestImportParquetStmt(
+	t *testing.T,
+) (
+	tc serverutils.TestClusterInterface,
+	sqlDB *sqlutils.SQLRunner,
+	testFiles parquetTestFiles,
+	numFiles int,
+	rowsPerFile int,
+) {
+	skip.UnderShort(t)
+	skip.UnderRace(t, "takes >1min under race")
+
+	const nodes = 3
+
+	numFiles = nodes + 2
+	rowsPerFile = 1000
+	rowsPerRaceFile := 16
+
+	baseDir := datapathutils.TestDataPath(t, "parquet")
+
+	// Check if test data exists - skip test if not generated yet
+	// TODO(sql-experience): Generate proper Parquet test data files
+	// Run with COCKROACH_REWRITE_PARQUET_TESTDATA=true to generate
+	testDataPath := filepath.Join(baseDir, "data-0.parquet")
+	if _, err := os.Stat(testDataPath); os.IsNotExist(err) {
+		skip.IgnoreLint(t, "Parquet test data not generated - run with COCKROACH_REWRITE_PARQUET_TESTDATA=true")
+	}
+
+	tc = serverutils.StartCluster(t, nodes, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		},
+		ExternalIODir: baseDir,
+	}})
+	conn := tc.ServerConn(0)
+
+	sqlDB = sqlutils.MakeSQLRunner(conn)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.batch_size = '10KB'`)
+
+	testFiles = makeParquetData(t, numFiles, rowsPerFile, nodes, rowsPerRaceFile)
+	if util.RaceEnabled {
+		// This test takes a while with the race detector, so reduce the number of
+		// files and rows per file in an attempt to speed it up.
+		numFiles = nodes
+		rowsPerFile = rowsPerRaceFile
+	}
+	return tc, sqlDB, testFiles, numFiles, rowsPerFile
+}
+
+func TestImportParquetStmt(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc, sqlDB, testFiles, numFiles, rowsPerFile := setupTestImportParquetStmt(t)
+	defer tc.Stopper().Stop(ctx)
+
+	empty := []string{"'nodelocal://1/empty.parquet'"}
+
+	// Support subtests by keeping track of the number of jobs that are executed.
+	testNum := -1
+	expectedRows := numFiles * rowsPerFile
+	for i, tc := range []struct {
+		name        string
+		createQuery string
+		query       string // must have one `%s` for the files list.
+		files       []string
+		jobOpts     string
+		err         string
+	}{
+		{
+			"basic",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO t PARQUET DATA (%s)`,
+			testFiles.files,
+			``,
+			"",
+		},
+		// TODO(sql-experience): Enable empty file tests once we can generate valid 0-row Parquet files
+		// Apache Arrow's pqarrow library has issues creating valid empty Parquet files
+		// {
+		// 	"empty-file",
+		// 	`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+		// 	`IMPORT INTO t PARQUET DATA (%s)`,
+		// 	empty,
+		// 	``,
+		// 	"",
+		// },
+		// {
+		// 	"empty-with-files",
+		// 	`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+		// 	`IMPORT INTO t PARQUET DATA (%s)`,
+		// 	append(empty, testFiles.files...),
+		// 	``,
+		// 	"",
+		// },
+		{
+			"auto-decompress",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO t PARQUET DATA (%s) WITH decompress = 'auto'`,
+			testFiles.files,
+			` WITH OPTIONS (decompress = 'auto')`,
+			"",
+		},
+		{
+			"no-decompress",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO t PARQUET DATA (%s) WITH decompress = 'none'`,
+			testFiles.files,
+			` WITH OPTIONS (decompress = 'none')`,
+			"",
+		},
+		{
+			"gzip-compressed",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO t PARQUET DATA (%s)`,
+			testFiles.gzipFiles,
+			``,
+			"",
+		},
+		{
+			"snappy-compressed",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO t PARQUET DATA (%s)`,
+			testFiles.snappyFiles,
+			``,
+			"",
+		},
+		// NB: successes above, failures below, because we check the i-th job.
+		{
+			"bad-opt-name",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO t PARQUET DATA (%s) WITH foo = 'bar'`,
+			testFiles.files,
+			``,
+			"invalid option \"foo\"",
+		},
+		{
+			"primary-key-dup",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO t PARQUET DATA (%s)`,
+			testFiles.filesWithDups,
+			``,
+			"duplicate key in primary index",
+		},
+		{
+			"no-database",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO nonexistent.t PARQUET DATA (%s)`,
+			testFiles.files,
+			``,
+			`database does not exist: "nonexistent.t"`,
+		},
+		{
+			"into-db-fails",
+			`CREATE TABLE t (a int8 primary key, b string, index (b), index (a, b))`,
+			`IMPORT INTO t PARQUET DATA (%s) WITH into_db = 'test'`,
+			testFiles.files,
+			``,
+			`invalid option "into_db"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			intodb := fmt.Sprintf(`parquet%d`, i)
+			sqlDB.Exec(t, fmt.Sprintf(`CREATE DATABASE %s`, intodb))
+			sqlDB.Exec(t, fmt.Sprintf(`SET DATABASE = %s`, intodb))
+
+			var unused string
+			var restored struct {
+				rows, idx, bytes int
+			}
+
+			if tc.createQuery != "" {
+				sqlDB.Exec(t, tc.createQuery)
+			}
+
+			var result int
+			query := fmt.Sprintf(tc.query, strings.Join(tc.files, ", "))
+			testNum++
+			if tc.err != "" {
+				sqlDB.ExpectErr(t, tc.err, query)
+				return
+			}
+			sqlDB.QueryRow(t, query).Scan(
+				&unused, &unused, &unused, &restored.rows, &restored.idx, &restored.bytes,
+			)
+
+			jobPrefix := fmt.Sprintf(`IMPORT INTO %s.public.t`, intodb)
+
+			var intodbID descpb.ID
+			sqlDB.QueryRow(t, fmt.Sprintf(`SELECT id FROM system.namespace WHERE name = '%s'`,
+				intodb)).Scan(&intodbID)
+			var publicSchemaID descpb.ID
+			sqlDB.QueryRow(t, fmt.Sprintf(`SELECT id FROM system.namespace WHERE name = '%s' AND "parentID" = %d`,
+				catconstants.PublicSchemaName, intodbID)).Scan(&publicSchemaID)
+			var tableID int64
+			sqlDB.QueryRow(t, `SELECT id FROM system.namespace WHERE "parentID" = $1 AND "parentSchemaID" = $2`,
+				intodbID, publicSchemaID).Scan(&tableID)
+
+			if err := jobutils.VerifySystemJob(t, sqlDB, testNum, jobspb.TypeImport, jobs.StateSucceeded, jobs.Record{
+				Username:      username.RootUserName(),
+				Description:   fmt.Sprintf(jobPrefix+` PARQUET DATA (%s)`+tc.jobOpts, strings.Join(tc.files, ", ")),
+				DescriptorIDs: []descpb.ID{descpb.ID(tableID)},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			isEmpty := len(tc.files) == 1 && tc.files[0] == empty[0]
+
+			if isEmpty {
+				sqlDB.QueryRow(t, `SELECT count(*) FROM t`).Scan(&result)
+				if expect := 0; result != expect {
+					t.Fatalf("expected %d rows, got %d", expect, result)
+				}
+				return
+			}
+
+			if expected, actual := expectedRows, restored.rows; expected != actual {
+				t.Fatalf("expected %d rows, got %d", expected, actual)
+			}
+
+			// Verify correct number of rows via COUNT.
+			sqlDB.QueryRow(t, `SELECT count(*) FROM t`).Scan(&result)
+			if expect := expectedRows; result != expect {
+				t.Fatalf("expected %d rows, got %d", expect, result)
+			}
+		})
+	}
+}
+
 func TestImportCSVStmtCheckpointLeftover(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
