@@ -137,6 +137,7 @@ go_test(
         "import_csv_mark_redaction_test.go",
         "import_into_test.go",
         "import_mvcc_test.go",
+        "import_parquet_bench_test.go",
         "import_processor_test.go",
         "import_stmt_test.go",
         "main_test.go",
