@@ -1611,3 +1611,298 @@ func TestParquetPlainPrimitivesValidation(t *testing.T) {
 
 	t.Log("Successfully validated plain primitive types through consumer creation")
 }
+
+// TestParquetListSchemaDetection verifies that detectListColumn correctly
+// identifies valid LIST columns and rejects unsupported nesting.
+func TestParquetListSchemaDetection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	pool := memory.NewGoAllocator()
+
+	t.Run("DetectsListColumn", func(t *testing.T) {
+		arrowSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true},
+		}, nil)
+		builder := array.NewRecordBuilder(pool, arrowSchema)
+		defer builder.Release()
+
+		lb := builder.Field(0).(*array.ListBuilder)
+		lb.Append(true)
+		lb.ValueBuilder().(*array.StringBuilder).Append("a")
+
+		record := builder.NewRecord()
+		defer record.Release()
+
+		buf := new(bytes.Buffer)
+		writerProps := parquet.NewWriterProperties(
+			parquet.WithCompression(compress.Codecs.Uncompressed))
+		writer, err := pqarrow.NewFileWriter(
+			arrowSchema, buf, writerProps, pqarrow.DefaultWriterProps())
+		require.NoError(t, err)
+		require.NoError(t, writer.Write(record))
+		require.NoError(t, writer.Close())
+
+		reader := bytes.NewReader(buf.Bytes())
+		fr := &fileReader{
+			Reader: reader, ReaderAt: reader, Seeker: reader,
+			total: int64(buf.Len()),
+		}
+		parquetReader, err := file.NewParquetReader(fr)
+		require.NoError(t, err)
+
+		pqSchema := parquetReader.MetaData().Schema
+		listInfo, err := detectListColumn(pqSchema, 0)
+		require.NoError(t, err)
+		require.NotNil(t, listInfo)
+		require.Equal(t, "tags", listInfo.columnName)
+		require.True(t, listInfo.elementIsOptional)
+		require.Equal(t, int16(3), listInfo.maxDefLevel)
+		require.Equal(t, int16(3), listInfo.presentElementDefLevel)
+		require.Equal(t, 1, listInfo.nestingDepth)
+		require.Len(t, listInfo.levels, 1)
+		require.Equal(t, int16(1), listInfo.levels[0].repLevel)
+		require.Equal(t, int16(0), listInfo.levels[0].nullListDefLevel)
+		require.Equal(t, int16(1), listInfo.levels[0].emptyListDefLevel)
+	})
+
+	t.Run("FlatColumnNotDetectedAsList", func(t *testing.T) {
+		arrowSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		}, nil)
+		builder := array.NewRecordBuilder(pool, arrowSchema)
+		defer builder.Release()
+
+		builder.Field(0).(*array.Int32Builder).Append(1)
+
+		record := builder.NewRecord()
+		defer record.Release()
+
+		buf := new(bytes.Buffer)
+		writerProps := parquet.NewWriterProperties(
+			parquet.WithCompression(compress.Codecs.Uncompressed))
+		writer, err := pqarrow.NewFileWriter(
+			arrowSchema, buf, writerProps, pqarrow.DefaultWriterProps())
+		require.NoError(t, err)
+		require.NoError(t, writer.Write(record))
+		require.NoError(t, writer.Close())
+
+		reader := bytes.NewReader(buf.Bytes())
+		fr := &fileReader{
+			Reader: reader, ReaderAt: reader, Seeker: reader,
+			total: int64(buf.Len()),
+		}
+		parquetReader, err := file.NewParquetReader(fr)
+		require.NoError(t, err)
+
+		pqSchema := parquetReader.MetaData().Schema
+		listInfo, err := detectListColumn(pqSchema, 0)
+		require.NoError(t, err)
+		require.Nil(t, listInfo, "flat column should not be detected as LIST")
+	})
+}
+
+// TestParquetListEndToEnd tests the full producer/consumer pipeline for LIST
+// columns, verifying that data flows correctly from Parquet file through to
+// CockroachDB datums.
+func TestParquetListEndToEnd(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	pool := memory.NewGoAllocator()
+
+	t.Run("ListToArray", func(t *testing.T) {
+		arrowSchema := arrow.NewSchema([]arrow.Field{
+			{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+			{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true},
+		}, nil)
+		builder := array.NewRecordBuilder(pool, arrowSchema)
+		defer builder.Release()
+
+		idBuilder := builder.Field(0).(*array.Int32Builder)
+		lb := builder.Field(1).(*array.ListBuilder)
+		vb := lb.ValueBuilder().(*array.StringBuilder)
+
+		// Row 0: id=1, tags=["a", "b"]
+		idBuilder.Append(1)
+		lb.Append(true)
+		vb.Append("a")
+		vb.Append("b")
+
+		// Row 1: id=2, tags=null
+		idBuilder.Append(2)
+		lb.AppendNull()
+
+		// Row 2: id=3, tags=[]
+		idBuilder.Append(3)
+		lb.Append(true)
+
+		// Row 3: id=4, tags=["x"]
+		idBuilder.Append(4)
+		lb.Append(true)
+		vb.Append("x")
+
+		record := builder.NewRecord()
+		defer record.Release()
+
+		buf := new(bytes.Buffer)
+		writerProps := parquet.NewWriterProperties(
+			parquet.WithCompression(compress.Codecs.Uncompressed))
+		writer, err := pqarrow.NewFileWriter(
+			arrowSchema, buf, writerProps, pqarrow.DefaultWriterProps())
+		require.NoError(t, err)
+		require.NoError(t, writer.Write(record))
+		require.NoError(t, writer.Close())
+
+		reader := bytes.NewReader(buf.Bytes())
+		fr := &fileReader{
+			Reader: reader, ReaderAt: reader, Seeker: reader,
+			total: int64(buf.Len()),
+		}
+
+		// Create a table descriptor with matching columns.
+		tableDesc := descpb.TableDescriptor{
+			ID:   1,
+			Name: "test_table",
+			Columns: []descpb.ColumnDescriptor{
+				{ID: 1, Name: "id", Type: types.Int4},
+				{ID: 2, Name: "tags", Type: types.MakeArray(types.String)},
+			},
+			PrimaryIndex: descpb.IndexDescriptor{
+				ID:                  1,
+				Name:                "pk",
+				KeyColumnIDs:        []descpb.ColumnID{1},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+			},
+		}
+
+		immTableDesc := tabledesc.NewBuilder(&tableDesc).BuildImmutableTable()
+		importCtx := &parallelImportContext{
+			tableDesc:  immTableDesc,
+			targetCols: tree.NameList{"id", "tags"},
+		}
+
+		producer, err := newParquetRowProducer(fr, importCtx)
+		require.NoError(t, err)
+
+		consumer, err := newParquetRowConsumer(importCtx, producer, nil, false)
+		require.NoError(t, err)
+		require.NotNil(t, consumer)
+
+		// Verify the LIST column was detected.
+		meta := producer.columnMetadata
+		var listColIdx int
+		found := false
+		for idx, m := range meta {
+			if m.isList {
+				listColIdx = idx
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "should find a LIST column in metadata")
+		require.Equal(t, "tags", meta[listColIdx].listInfo.columnName)
+	})
+}
+
+// TestParquetListMultiBatch verifies that LIST column data is correctly
+// preserved across multiple fillBuffer calls. This is the regression test
+// for the data loss bug where level entries consumed by a chunk read but
+// beyond the batch boundary were silently discarded.
+func TestParquetListMultiBatch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	pool := memory.NewGoAllocator()
+
+	// Create a file with 300 rows (batch size is 100, so 3 fillBuffer calls).
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+		{Name: "scores", Type: arrow.ListOf(arrow.PrimitiveTypes.Int32), Nullable: true},
+	}, nil)
+	builder := array.NewRecordBuilder(pool, arrowSchema)
+	defer builder.Release()
+
+	idBuilder := builder.Field(0).(*array.Int32Builder)
+	lb := builder.Field(1).(*array.ListBuilder)
+	vb := lb.ValueBuilder().(*array.Int32Builder)
+
+	numRows := 300
+	for i := range numRows {
+		idBuilder.Append(int32(i))
+		if i%10 == 0 {
+			// Every 10th row: null list.
+			lb.AppendNull()
+		} else if i%10 == 1 {
+			// Every 10th+1 row: empty list.
+			lb.Append(true)
+		} else {
+			// Other rows: [i*100, i*100+1, i*100+2].
+			lb.Append(true)
+			vb.Append(int32(i * 100))
+			vb.Append(int32(i*100 + 1))
+			vb.Append(int32(i*100 + 2))
+		}
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	buf := new(bytes.Buffer)
+	writerProps := parquet.NewWriterProperties(
+		parquet.WithCompression(compress.Codecs.Uncompressed))
+	writer, err := pqarrow.NewFileWriter(
+		arrowSchema, buf, writerProps, pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+	require.NoError(t, writer.Write(record))
+	require.NoError(t, writer.Close())
+
+	reader := bytes.NewReader(buf.Bytes())
+	fr := &fileReader{
+		Reader: reader, ReaderAt: reader, Seeker: reader,
+		total: int64(buf.Len()),
+	}
+
+	// Read through the full producer pipeline (no importCtx = test mode).
+	producer, err := newParquetRowProducer(fr, nil)
+	require.NoError(t, err)
+
+	rowIdx := 0
+	for producer.Scan() {
+		rowData, err := producer.Row()
+		require.NoError(t, err)
+
+		view := rowData.(*parquetRowView)
+		// Find the LIST column batch (column with isList=true).
+		for colIdx := range view.numColumns {
+			batch := view.batches[colIdx]
+			if batch == nil || !batch.isList {
+				continue
+			}
+
+			val, isNull, err := batch.GetValueAt(int(view.rowIndex))
+			require.NoError(t, err, "row %d", rowIdx)
+
+			if rowIdx%10 == 0 {
+				// Null list.
+				require.True(t, isNull, "row %d should be null", rowIdx)
+			} else if rowIdx%10 == 1 {
+				// Empty list.
+				require.False(t, isNull, "row %d should not be null", rowIdx)
+				elements := val.([]any)
+				require.Len(t, elements, 0, "row %d should be empty list", rowIdx)
+			} else {
+				// 3-element list.
+				require.False(t, isNull, "row %d should not be null", rowIdx)
+				elements := val.([]any)
+				require.Len(t, elements, 3, "row %d", rowIdx)
+				require.Equal(t, int32(rowIdx*100), elements[0], "row %d elem 0", rowIdx)
+				require.Equal(t, int32(rowIdx*100+1), elements[1], "row %d elem 1", rowIdx)
+				require.Equal(t, int32(rowIdx*100+2), elements[2], "row %d elem 2", rowIdx)
+			}
+		}
+		rowIdx++
+	}
+	require.NoError(t, producer.Err())
+	require.Equal(t, numRows, rowIdx, "should read all rows")
+}
